@@ -368,9 +368,9 @@ const gauth = {
     });
     if (resp.error || !resp.access_token) {
       const msg = {
-        popup_closed: "Google sign-in was closed before it finished.",
+        popup_closed: "Google sign-in was closed before it finished. If Google said “Access blocked”, add the Gmail address you signed in with as a test user (Google Auth Platform › Audience › Test users), wait a minute, then try again.",
         popup_failed_to_open: "Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again.",
-        access_denied: "Google sign-in was cancelled.",
+        access_denied: "Google sign-in was cancelled. If Google said “Access blocked”, add the Gmail address you signed in with as a test user (Google Auth Platform › Audience › Test users), then try again.",
       }[resp.error] || `Google sign-in failed: ${resp.error_description || resp.error}`;
       flash(msg);
       return false;

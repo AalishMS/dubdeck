@@ -56,8 +56,9 @@ Spotify's embed pages and ytmusicapi are unofficial interfaces, so either could 
    - set it as `GOOGLE_CLIENT_ID` in the Vercel project's environment variables, or
    - paste it into the page when Dubdeck asks.
 
-While the app is in Testing mode, only the test users you add can sign in. Google shows an
-"unverified app" notice; continue past it.
+While the app is in Testing mode, only the test users you add can sign in. Anyone else gets
+"Access blocked: … has not completed the Google verification process" (Error 403: access_denied).
+Test users see an "unverified app" notice instead; continue past it.
 
 ## Run locally
 
