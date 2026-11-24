@@ -17,17 +17,31 @@ Copy your Spotify playlists (and Liked Songs) to YouTube Music, with no Spotify 
      - Spotify's own data download (`Playlist1.json`, `YourLibrary.json`)
 2. **Check matches.** Each song is looked up on YouTube Music by its ISRC when Spotify shares one, then
    by title, artist and length. Each match gets a confidence meter. Uncertain ones (another remix, a
-   live version, a big length difference) are flagged so you can pick another candidate or paste a link.
-3. **Transfer.** Sign in with Google. Dubdeck creates private playlists through the official YouTube
-   Data API.
+   live version, a big length difference) are flagged.
+   - **Listen to both sides.** Press a song's number to hear the Spotify original (side A), or the cover
+     of the match to hear it on YouTube Music (side B).
+   - **Check them one by one** steps through only the uncertain and missing songs, keyboard first:
+     <kbd>Enter</kbd> keeps, <kbd>1</kbd>–<kbd>9</kbd> picks another version, <kbd>X</kbd> leaves it out,
+     <kbd>A</kbd>/<kbd>B</kbd> play each side, <kbd>/</kbd> searches. Or keep or drop them all at once.
+   - **Change** searches YouTube Music with your own words or takes a pasted link.
+   - **Download the list** as a CSV with both sides' links.
+3. **Transfer.** Sign in with Google. Dubdeck writes playlists through the official YouTube Data API.
+   - **Send to** a new playlist or one you already have. Songs already in it are skipped, so sending
+     the same Spotify playlist again later adds only what's new. Dubdeck remembers where each playlist
+     went and picks that next time.
    - Google's default limit is about 200 songs a day for each Google Cloud project.
-   - When the limit runs out, the transfer pauses and saves its progress in your browser. Press
-     **Continue transfer** after midnight Pacific time.
+   - When the limit runs out, the transfer pauses and saves its progress in your browser. A countdown
+     shows when it resets (midnight Pacific time), and **Add a reminder to my calendar** downloads an
+     event for then. Press **Continue transfer** to pick up where it stopped.
+   - **Use my own Google project** (page footer) signs in through a project you made, which gives you
+     your own daily limit and gets past "Access blocked" while the shared app is in Testing mode.
 
 ## How it's built
 
 - **No credentials on the server.** The FastAPI backend is stateless and has two jobs:
-  - reading public playlists and profiles the way Spotify's own embed widget does (no account needed)
+  - reading public playlists and profiles the way Spotify's own embed widget does (no account needed).
+    When the anonymous token's quota for batch song details runs out, it reads them one song at a time
+    from the metadata endpoint Spotify's own clients use, so a whole playlist still comes over with ISRCs.
   - searching YouTube Music anonymously via [ytmusicapi](https://github.com/sigma67/ytmusicapi)
 - **Google sign-in runs in the browser** (Google Identity Services). The browser writes playlists to
   YouTube directly. The access token never reaches the server.
@@ -73,6 +87,9 @@ uv run python -m app
 ```
 
 This opens http://127.0.0.1:8765. `PORT` and `NO_BROWSER=1` are optional.
+
+YouTube's player refuses to play inside a page opened by IP address, so to try the listen buttons
+locally open http://localhost:8765 instead (and add it to your Google client's JavaScript origins).
 
 ## Deploy
 

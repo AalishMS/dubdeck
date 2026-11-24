@@ -79,6 +79,32 @@ const region = (() => {
   }
   return null;
 })();
+const debounce = (fn, ms) => {
+  let t;
+  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+};
+const etaText = (sec) => {
+  if (sec < 50) return "Less than a minute left";
+  const m = Math.round(sec / 60);
+  return `About ${m < 60 ? plural(m, "minute") : `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min`} left`;
+};
+const fmtDay = (ms) => new Date(ms).toLocaleDateString([], { day: "numeric", month: "short" });
+
+function downloadFile(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = h("a", { href: url, download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// A spreadsheet would run a cell starting with = + - @ as a formula, so those get a leading '.
+const csvCell = (v) => {
+  let s = v == null ? "" : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
 
 // ------------------------------------------------------------------ state
 
@@ -89,12 +115,23 @@ const state = {
   review: store.get("review"),
   transfer: store.get("transfer"),
   filter: "all",
+  songQuery: "",
   openAlt: null,
   shown: {},
-  run: null, // { kind, cancelled } while importing / matching / transferring
+  run: null, // { kind, cancelled, t0, d0 } while importing / matching / transferring
   view: null,
+  ytPlaylists: null, // the signed-in user's YouTube playlists, read once for "Send to"
 };
 const matchCache = new Map();
+
+// Which YouTube playlist each Spotify playlist went to, so the next transfer can add only new songs.
+const sentTo = {
+  key: (pl) => (pl.liked ? "liked" : pl.sid ? `sp:${pl.sid}` : `name:${pl.name.trim().toLowerCase()}`),
+  all: () => store.get("history", {}),
+  get(pl) { return this.all()[this.key(pl)] || null; },
+  put(key, entry) { const all = this.all(); all[key] = { ...entry, at: Date.now() }; store.set("history", all); },
+  drop(key) { const all = this.all(); delete all[key]; store.set("history", all); },
+};
 
 function saveLibrary() {
   const ok = store.set("library", state.library);
@@ -245,7 +282,7 @@ $("#form-paste").addEventListener("submit", async (e) => {
   }
 
   const cancelled = state.run.cancelled;
-  state.run = null;
+  endRun();
   setTape(0, false);
   resetDeck();
   // Playlists pasted by link are ticked straight away. A whole profile isn't: the user picks from it.
@@ -256,7 +293,13 @@ $("#form-paste").addEventListener("submit", async (e) => {
   if (cancelled) notes.unshift("Stopped. Anything read before you stopped was added.");
   goAdd();
   if (notes.length) flash(notes.join(" "));
-  else if (fromProfiles.length) $("#shelf-head").scrollIntoView({ block: "start", behavior: "smooth" });
+  else if (fromProfiles.length || n) $("#shelf-head").scrollIntoView({ block: "start", behavior: "smooth" });
+});
+
+const EXAMPLE = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M";
+$("#try-example").addEventListener("click", () => {
+  $("#paste-box").value = EXAMPLE;
+  $("#form-paste").requestSubmit();
 });
 
 // ------------------------------------------------------------------ importing: files
@@ -394,6 +437,8 @@ const YT_API = "https://www.googleapis.com/youtube/v3";
 
 const gauth = {
   clientId() { return store.get("google.clientId") || state.config.google_client_id || null; },
+  // True when this browser signs in through a Google project the user made, not the site's shared one.
+  usingOwn() { return !!store.get("google.clientId") && store.get("google.clientId") !== state.config.google_client_id; },
   token() {
     const t = store.get("google.token");
     return t && t.expires_at - Date.now() > 60_000 ? t.access_token : null;
@@ -421,11 +466,20 @@ const gauth = {
       client.requestAccessToken();
     });
     if (resp.error || !resp.access_token) {
-      const msg = {
-        popup_closed: "Google sign-in was closed before it finished. If Google said “Access blocked”, add the Gmail address you signed in with as a test user (Google Auth Platform › Audience › Test users), wait a minute, then try again.",
-        popup_failed_to_open: "Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again.",
-        access_denied: "Google sign-in was cancelled. If Google said “Access blocked”, add the Gmail address you signed in with as a test user (Google Auth Platform › Audience › Test users), then try again.",
-      }[resp.error] || `Google sign-in failed: ${resp.error_description || resp.error}`;
+      const maybeBlocked = resp.error === "popup_closed" || resp.error === "access_denied";
+      const first = resp.error === "access_denied" ? "Google sign-in was cancelled." : "Google sign-in was closed before it finished.";
+      if (maybeBlocked && !this.usingOwn()) {
+        flash(
+          `${first} If Google said “Access blocked”, Dubdeck's Google app is still waiting for Google's review, so only people on its test list can sign in. You can sign in through your own free Google project instead. It takes about ten minutes and gives you your own daily limit too.`,
+          [{ label: "Use my own Google project", run: () => showGoogleSetup() }]
+        );
+        return false;
+      }
+      const msg = maybeBlocked
+        ? `${first} If Google said “Access blocked”, add the Gmail address you signed in with as a test user of your Google project (Google Auth Platform › Audience › Test users), wait a minute, then try again.`
+        : resp.error === "popup_failed_to_open"
+          ? "Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again."
+          : `Google sign-in failed: ${resp.error_description || resp.error}`;
       flash(msg);
       return false;
     }
@@ -443,6 +497,7 @@ const gauth = {
     }
     renderDecks();
     renderActionBar();
+    if (state.view === "review") loadYtPlaylists();
     return true;
   },
 
@@ -451,10 +506,35 @@ const gauth = {
     if (t?.access_token && window.google?.accounts?.oauth2) window.google.accounts.oauth2.revoke(t.access_token, () => {});
     store.del("google.token");
     store.del("google.account");
+    state.ytPlaylists = null;
+    ytAccountGen++;
     renderDecks();
     renderActionBar();
+    if (state.view === "review") renderReview();
   },
 };
+
+// The signed-in user's own playlists, for "Send to". Costs 1 quota unit per 50 playlists.
+let ytPlaylistsLoading = null;
+let ytAccountGen = 0; // bumped on sign-out, so a late answer for the old account is dropped
+function loadYtPlaylists() {
+  if (!gauth.signedIn() || state.ytPlaylists || ytPlaylistsLoading) return ytPlaylistsLoading;
+  const gen = ytAccountGen;
+  ytPlaylistsLoading = yt.myPlaylists()
+    .then((list) => { if (gen === ytAccountGen) { state.ytPlaylists = list; refreshTargets(); } })
+    .catch(() => { if (gen === ytAccountGen) state.ytPlaylists = []; }) // a convenience only: don't retry
+    .finally(() => { ytPlaylistsLoading = null; });
+  return ytPlaylistsLoading;
+}
+
+// Swap in fresh "Send to" lists without redrawing the songs, so nothing the user is doing is lost.
+function refreshTargets() {
+  if (state.view !== "review" || !state.review) return;
+  for (const sel of $$("#review-list select[id^='pl-target-']")) {
+    const pl = state.review.playlists[Number(sel.id.slice("pl-target-".length))];
+    if (pl && sel !== document.activeElement) sel.replaceWith(targetSelect(pl, sel.id, sel._onPick));
+  }
+}
 
 async function ytApi(method, path, { params, body } = {}) {
   const token = gauth.token();
@@ -513,6 +593,37 @@ const yt = {
   like(videoId) {
     return ytApi("POST", "/videos/rate", { params: { id: videoId, rating: "like" } });
   },
+  async myPlaylists() {
+    const out = [];
+    let pageToken;
+    for (let page = 0; page < 10; page++) {
+      const data = await ytApi("GET", "/playlists", { params: { part: "snippet,contentDetails", mine: "true", maxResults: "50", ...(pageToken ? { pageToken } : {}) } });
+      for (const p of data.items || []) out.push({ id: p.id, title: p.snippet?.title || "Untitled", count: p.contentDetails?.itemCount ?? null });
+      pageToken = data.nextPageToken;
+      if (!pageToken) break;
+    }
+    return out;
+  },
+  // Video ids already in a playlist: 1 quota unit per 50, against 50 units for each song added twice.
+  async itemIds(playlistId) {
+    const have = new Set();
+    let pageToken;
+    do {
+      const data = await ytApi("GET", "/playlistItems", { params: { part: "contentDetails", playlistId, maxResults: "50", ...(pageToken ? { pageToken } : {}) } });
+      for (const it of data.items || []) if (it.contentDetails?.videoId) have.add(it.contentDetails.videoId);
+      pageToken = data.nextPageToken;
+    } while (pageToken);
+    return have;
+  },
+  // Which of these videos the user has already liked: 1 unit per 50.
+  async liked(ids) {
+    const have = new Set();
+    for (let i = 0; i < ids.length; i += 50) {
+      const data = await ytApi("GET", "/videos/getRating", { params: { id: ids.slice(i, i + 50).join(",") } });
+      for (const r of data.items || []) if (r.rating === "like") have.add(r.videoId);
+    }
+    return have;
+  },
 };
 
 function friendlyYtError(e) {
@@ -550,7 +661,7 @@ function cassetteMarkup(k) {
     <rect class="c-label" x="20" y="14" width="260" height="114" rx="6"/>
     <rect class="c-stripe-1" x="20" y="96" width="260" height="6"/>
     <rect class="c-stripe-2" x="20" y="104" width="260" height="6"/>
-    <text class="c-side" x="32" y="52">A</text>
+    <text class="c-side" x="32" y="52">${k.toUpperCase()}</text>
     <text class="c-title" x="62" y="50" id="label-${k}"></text>
     <rect class="c-window" x="72" y="66" width="156" height="44" rx="7"/>
     <g clip-path="url(#win-${k})">
@@ -627,24 +738,73 @@ function show(view) {
     if (n === current) li.setAttribute("aria-current", "step");
     else li.removeAttribute("aria-current");
   });
+  if (view !== "review") stopPlayer();
   state.view = view;
   renderActionBar();
 }
 
-function flash(msg) {
+// A problem the user has to read. `actions` are buttons that fix it: [{ label, run }].
+function flash(msg, actions = []) {
   $("#flash-text").textContent = msg;
+  $("#flash-actions").replaceChildren(...actions.map((a) =>
+    h("button", { type: "button", class: "key key-small", onclick: () => { clearFlash(); a.run(); } }, a.label)
+  ));
   $("#flash").hidden = false;
   $("#flash").scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 function clearFlash() { $("#flash").hidden = true; }
 $("#flash-close").addEventListener("click", clearFlash);
 
+// A short note that goes away by itself, with an optional action such as Undo.
+let toastTimer;
+function toast(msg, action) {
+  clearTimeout(toastTimer);
+  $("#toast-text").textContent = msg;
+  const btn = $("#toast-act");
+  btn.hidden = !action;
+  if (action) {
+    btn.textContent = action.label;
+    btn.onclick = () => { hideToast(); action.run(); };
+  }
+  $("#toast").hidden = false;
+  toastTimer = setTimeout(hideToast, action ? 7000 : 3500);
+}
+function hideToast() { clearTimeout(toastTimer); $("#toast").hidden = true; }
+
 function showGoogleSetup() {
+  const site = state.config.google_client_id;
+  const own = gauth.usingOwn();
   $("#g-origin").textContent = location.origin;
+  $("#g-title").textContent = site ? "Use your own Google project" : "Set up Google sign-in";
+  $("#g-lede").textContent = site
+    ? "Dubdeck signs in through one shared Google project, so everyone using this site shares its daily limit of about 200 songs. Until Google finishes reviewing it, it also only lets in people on its test list. A Google project of your own is free, takes about ten minutes, and gives you your own limit."
+    : "This copy of Dubdeck doesn't have a Google sign-in ID yet. Making one is free and takes about ten minutes.";
+  const cur = $("#g-current");
+  cur.hidden = !own;
+  if (own) {
+    cur.replaceChildren(
+      "You're signing in through your own project (", h("code", { text: clip(store.get("google.clientId"), 28) }), "). ",
+      site ? h("button", { type: "button", class: "textbtn", onclick: () => switchClientId(null) }, "Go back to Dubdeck's") : null
+    );
+  }
+  $("#google-client-id").value = own ? store.get("google.clientId") : "";
   $("#google-setup").hidden = false;
   $("#google-setup").scrollIntoView({ block: "start", behavior: "smooth" });
 }
+
+function switchClientId(id) {
+  if (gauth.signedIn()) gauth.signOut(); // a token belongs to the project that issued it
+  if (id) store.set("google.clientId", id);
+  else store.del("google.clientId");
+  $("#google-setup").hidden = true;
+  clearFlash();
+  if (id) gauth.signIn();
+  else toast("Back to Dubdeck's Google project.");
+}
+
 $("#copy-origin").addEventListener("click", (e) => copyText(location.origin, e.currentTarget));
+$("#g-close").addEventListener("click", () => ($("#google-setup").hidden = true));
+$("#own-project").addEventListener("click", () => showGoogleSetup());
 $("#form-google").addEventListener("submit", (e) => {
   e.preventDefault();
   const id = $("#google-client-id").value.trim();
@@ -652,10 +812,20 @@ $("#form-google").addEventListener("submit", (e) => {
     flash("That doesn't look like a Google client ID. It ends in .apps.googleusercontent.com.");
     return;
   }
-  store.set("google.clientId", id);
-  $("#google-setup").hidden = true;
-  clearFlash();
-  gauth.signIn();
+  switchClientId(id);
+});
+
+// Colours: Auto follows the system; Light and Dark stick.
+function applyTheme(t) {
+  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  else delete document.documentElement.dataset.theme;
+}
+$$("#theme-switch input").forEach((r) => {
+  r.checked = r.value === (store.get("theme") || "auto");
+  r.addEventListener("change", () => {
+    store.set("theme", r.value);
+    applyTheme(r.value);
+  });
 });
 
 function renderActionBar() {
@@ -696,6 +866,11 @@ function renderActionBar() {
     bar.hidden = true;
   }
 }
+
+// The player and toasts float just above the sticky action bar, whatever its height.
+new ResizeObserver(() => {
+  document.documentElement.style.setProperty("--bar-h", `${$("#actionbar").offsetHeight}px`);
+}).observe($("#actionbar"));
 
 async function copyText(text, btn) {
   const old = btn.textContent;
@@ -763,9 +938,22 @@ function shelfItem(p) {
     ),
     h("button", {
       type: "button", class: "tape-remove", "aria-label": `Remove ${p.name}`,
-      onclick: () => { state.library = state.library.filter((x) => x.uid !== p.uid); state.selected.delete(p.uid); saveLibrary(); renderShelf(); },
+      onclick: () => removeFromShelf((x) => x.uid === p.uid, `Removed “${clip(p.name, 40)}”.`),
     }, "Remove")
   );
+}
+
+// Removing is instant; the toast offers Undo for a few seconds.
+function removeFromShelf(match, message) {
+  const before = { library: state.library, selected: new Set(state.selected) };
+  state.library = state.library.filter((x) => !match(x));
+  state.library.length === 0 ? state.selected.clear() : before.library.filter(match).forEach((x) => state.selected.delete(x.uid));
+  saveLibrary();
+  renderShelf();
+  toast(message, {
+    label: "Undo",
+    run: () => { state.library = before.library; state.selected = before.selected; saveLibrary(); renderShelf(); },
+  });
 }
 
 $("#pl-filter").addEventListener("input", renderShelf);
@@ -777,20 +965,9 @@ $("#pl-all").addEventListener("click", () => {
   saveLibrary();
   renderShelf();
 });
-$("#pl-clear").addEventListener("click", (e) => {
-  const b = e.currentTarget;
-  if (b.dataset.armed !== "1") {
-    b.dataset.armed = "1";
-    b.textContent = "Click again to remove all";
-    setTimeout(() => { b.dataset.armed = "0"; b.textContent = "Remove all"; }, 3000);
-    return;
-  }
-  b.dataset.armed = "0";
-  b.textContent = "Remove all";
-  state.library = [];
-  state.selected.clear();
-  saveLibrary();
-  renderShelf();
+$("#pl-clear").addEventListener("click", () => {
+  const n = state.library.length;
+  removeFromShelf(() => true, `Removed ${plural(n, "playlist")}.`);
 });
 
 // ------------------------------------------------------------------ running work
@@ -799,8 +976,12 @@ function setWork(title, lede) {
   $("#work-title").textContent = title;
   $("#work-lede").textContent = lede;
   $("#work-label").textContent = "Starting…";
+  $("#work-eta").textContent = "";
   $("#work-bar i").style.width = "0%";
 }
+
+const BASE_TITLE = "Dubdeck";
+const RUN_TITLE = { import: "Reading", match: "Matching", transfer: "Transferring" };
 
 function tick({ label, done, total, verb }) {
   const p = total ? done / total : 0;
@@ -810,6 +991,17 @@ function tick({ label, done, total, verb }) {
   if (label) $("#work-label").textContent = label;
   $("#work-bar i").style.width = `${Math.round(p * 100)}%`;
   $("#work-bar").setAttribute("aria-valuenow", Math.round(p * 100));
+  const r = state.run;
+  if (!r) return;
+  document.title = total ? `${Math.round(p * 100)}% ${RUN_TITLE[r.kind]} · ${BASE_TITLE}` : `${RUN_TITLE[r.kind]} · ${BASE_TITLE}`;
+  // Time left, from the pace so far. Transfers stop at Google's daily limit, so they get none.
+  let eta = "";
+  if (total && r.kind !== "transfer") {
+    if (r.d0 == null || done < r.d0) { r.d0 = done; r.t0 = performance.now(); }
+    const secs = (performance.now() - r.t0) / 1000, n = done - r.d0;
+    if (secs > 4 && n >= 3 && done < total) eta = etaText(((total - done) * secs) / n);
+  }
+  $("#work-eta").textContent = eta;
 }
 
 $("#work-stop").addEventListener("click", (e) => {
@@ -819,11 +1011,43 @@ $("#work-stop").addEventListener("click", (e) => {
   e.currentTarget.textContent = "Stopping…";
 });
 
+// Keeps the screen on while something long runs, so a laptop doesn't sleep halfway through.
+const wake = {
+  lock: null,
+  wanted: false,
+  async on() {
+    this.wanted = true;
+    try {
+      const lock = await navigator.wakeLock?.request("screen");
+      if (this.wanted) this.lock = lock;
+      else lock?.release().catch(() => {}); // the run ended while the browser was deciding
+    } catch { this.lock = null; }
+  },
+  off() { this.wanted = false; this.lock?.release?.().catch(() => {}); this.lock = null; },
+};
+document.addEventListener("visibilitychange", () => {
+  if (state.run && document.visibilityState === "visible" && (!wake.lock || wake.lock.released)) wake.on();
+});
+
 function beginRun(kind) {
-  state.run = { kind, cancelled: false };
+  state.run = { kind, cancelled: false, t0: performance.now(), d0: null };
   const b = $("#work-stop");
   b.disabled = false;
   b.textContent = "Stop";
+  stopPlayer();
+  wake.on();
+}
+
+// `note` shows in the tab title while the tab is in the background, so a finished run is easy to spot.
+function endRun(note) {
+  state.run = null;
+  wake.off();
+  document.title = BASE_TITLE;
+  if (note && document.hidden) {
+    document.title = `${note} · ${BASE_TITLE}`;
+    const back = () => { if (!document.hidden) { document.title = BASE_TITLE; document.removeEventListener("visibilitychange", back); } };
+    document.addEventListener("visibilitychange", back);
+  }
 }
 
 window.addEventListener("beforeunload", (e) => {
@@ -862,7 +1086,7 @@ async function startMatch() {
     pls = pls.filter((p) => !p.pending && p.tracks.length);
     if (state.run.cancelled || !pls.length) {
       const stopped = state.run.cancelled;
-      state.run = null;
+      endRun();
       resetDeck();
       goAdd();
       if (stopped) problems.unshift("Stopped.");
@@ -892,7 +1116,7 @@ async function startMatch() {
       let results;
       for (let attempt = 0; ; attempt++) {
         try {
-          results = (await api("/api/ytm/match", { method: "POST", body: { tracks: batch.map((b) => b.t), region } })).results;
+          results = (await api("/api/ytm/match", { method: "POST", body: { tracks: batch.map((b) => trackBody(b.t)), region } })).results;
           break;
         } catch (err) {
           if (attempt < 2 && (err.status === 0 || err.status >= 500)) { await sleep(1500 * (attempt + 1)); continue; }
@@ -911,10 +1135,10 @@ async function startMatch() {
   };
   await Promise.all([worker(), worker()]);
   const cancelled = state.run.cancelled;
-  state.run = null;
+  endRun(cancelled ? null : "Matches ready");
 
   const playlists = pls.map((p, pi) => ({
-    name: p.name, description: p.description, image: p.image, liked: p.liked,
+    name: p.name, description: p.description, image: p.image, liked: p.liked, sid: p.sid, src: p.uid, source: p.source,
     tracks: p.tracks.map((t, ti) => rows[pi][ti] || { spotify: t, match: null, candidates: [], error: "Stopped before this song was matched." }),
   }));
   setTape(1, false);
@@ -927,13 +1151,18 @@ async function startMatch() {
 
 // ------------------------------------------------------------------ review
 
+// `t.ok` means the user has looked at this song and decided, so it no longer needs checking.
 function category(t) {
   if (!t.pick) return "missing";
-  if (t.pick.confidence === "high" || t.pick.confidence === "manual") return "ok";
+  if (t.ok || t.pick.confidence === "high" || t.pick.confidence === "manual") return "ok";
   return "review";
 }
+const needsCheck = (t) => !t.ok && category(t) !== "ok";
+
+const songText = (t) => [t.spotify.title, ...t.spotify.artists, t.spotify.album, t.pick?.title, t.pick?.artists].filter(Boolean).join(" ").toLowerCase();
 
 function inFilter(t) {
+  if (state.songQuery && !state.songQuery.split(/\s+/).every((w) => songText(t).includes(w))) return false;
   switch (state.filter) {
     case "review": return category(t) === "review";
     case "missing": return category(t) === "missing";
@@ -942,21 +1171,39 @@ function inFilter(t) {
   }
 }
 
+// A fresh match keeps what the user already decided: per playlist (name, visibility, where it goes)
+// and per song (the chosen version, ticked or not). Going back to add one more playlist loses nothing.
 function loadReview(playlists) {
   const many = playlists.length > 1;
+  const before = state.review?.playlists || [];
+  const plPrev = new Map(before.filter((pl) => pl.src).map((pl) => [pl.src, pl]));
+  const songPrev = new Map();
+  for (const pl of before) for (const t of pl.tracks) if (!t.error) songPrev.set(trackKey(t.spotify), t);
+
   state.review = {
-    playlists: playlists.map((pl) => ({
-      ...pl,
-      outName: pl.liked ? "Liked Songs from Spotify" : pl.name,
-      privacy: "PRIVATE",
-      mode: "playlist",
-      collapsed: many && pl.tracks.length > 60,
-      tracks: pl.tracks.map((t) => ({ ...t, pick: t.match, sel: !!t.match && t.match.confidence !== "low" })),
-    })),
+    playlists: playlists.map((pl) => {
+      const old = plPrev.get(pl.src);
+      const sent = sentTo.get(pl);
+      return {
+        ...pl,
+        outName: old?.outName ?? (pl.liked ? "Liked Songs from Spotify" : pl.name),
+        privacy: old?.privacy ?? "PRIVATE",
+        mode: old?.mode ?? "playlist",
+        target: old ? old.target ?? null : sent && pl.source !== "paste" ? { id: sent.playlistId, title: sent.title } : null,
+        collapsed: old?.collapsed ?? (many && pl.tracks.length > 60),
+        tracks: pl.tracks.map((t) => {
+          const prev = !t.error && songPrev.get(trackKey(t.spotify));
+          if (prev && (prev.ok || prev.pick)) return { ...t, candidates: prev.candidates, pick: prev.pick, sel: prev.sel, ok: prev.ok };
+          return { ...t, pick: t.match, sel: !!t.match && t.match.confidence !== "low" };
+        }),
+      };
+    }),
   };
   state.transfer = null;
   store.del("transfer");
   state.filter = "all";
+  state.songQuery = "";
+  $("#song-filter").value = "";
   state.openAlt = null;
   state.shown = {};
   saveReview(true);
@@ -990,6 +1237,7 @@ function renderFilterCounts() {
   $("#n-missing").textContent = c.missing.toLocaleString();
   $("#n-skipped").textContent = c.skipped.toLocaleString();
   $$("#filters button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.filter === state.filter)));
+  renderCheckstrip();
 }
 
 $$("#filters button").forEach((b) =>
@@ -1005,9 +1253,71 @@ $("#back-to-add").addEventListener("click", goAdd);
 
 function renderReview() {
   renderFilterCounts();
-  $("#review-list").replaceChildren(...state.review.playlists.map((pl, pi) => jcard(pl, pi)));
+  const cards = state.review.playlists
+    .map((pl, pi) => (state.songQuery && !pl.tracks.some(inFilter) ? null : jcard(pl, pi)))
+    .filter(Boolean);
+  $("#review-list").replaceChildren(...(cards.length ? cards : [h("p", { class: "panel empty-search", text: `No songs match “${state.songQuery}”.` })]));
   renderActionBar();
+  if (gauth.signedIn() && !state.ytPlaylists) loadYtPlaylists();
 }
+
+// The strip above the list: how many songs still need a decision, and ways to make them.
+function renderCheckstrip() {
+  const todo = state.review.playlists.flatMap((pl) => pl.tracks).filter(needsCheck);
+  const review = todo.filter((t) => category(t) === "review").length;
+  const missing = todo.length - review;
+  $("#checkstrip").hidden = !todo.length;
+  if (!todo.length) return;
+  const parts = [review ? `${plural(review, "match", "matches")} to check` : null, missing ? `${plural(missing, "song")} not found` : null];
+  $("#checkstrip-text").replaceChildren(
+    h("strong", { text: parts.filter(Boolean).join(" and ") }), ". ",
+    review
+      ? todo.length === 1 ? "Have a listen, or decide from here." : "Go through them one at a time with the keyboard, or decide for all the uncertain ones at once."
+      : todo.length === 1 ? "Search for it, or leave it out." : "Go through them to search for each one, or leave them out."
+  );
+  $("#keep-all").hidden = $("#drop-all").hidden = !review;
+  $("#keep-all").textContent = review === 1 ? "Keep it" : `Keep all ${review.toLocaleString()}`;
+  $("#drop-all").textContent = review === 1 ? "Leave it out" : `Leave all ${review.toLocaleString()} out`;
+  $("#check-start").textContent = todo.length === 1 ? "Check it" : "Check them one by one";
+}
+
+function decideAll(keep) {
+  const hit = state.review.playlists.flatMap((pl) => pl.tracks).filter((t) => needsCheck(t) && category(t) === "review");
+  const undo = hit.map((t) => [t, t.sel, t.ok]);
+  hit.forEach((t) => { t.sel = keep; t.ok = true; });
+  saveReview();
+  renderReview();
+  toast(`${keep ? "Kept" : "Left out"} ${plural(hit.length, "song")}.`, {
+    label: "Undo",
+    run: () => { undo.forEach(([t, sel, ok]) => { t.sel = sel; t.ok = ok; }); saveReview(); renderReview(); },
+  });
+}
+$("#keep-all").addEventListener("click", () => decideAll(true));
+$("#drop-all").addEventListener("click", () => decideAll(false));
+$("#check-start").addEventListener("click", () => openCheck());
+
+$("#song-filter").addEventListener("input", debounce((e) => {
+  state.songQuery = e.target.value.trim().toLowerCase();
+  state.shown = {};
+  state.openAlt = null;
+  renderReview();
+}, 150));
+
+function matchesCsv() {
+  const rows = [["Playlist", "Position", "Spotify title", "Spotify artists", "Spotify album", "Spotify link",
+    "YouTube Music title", "YouTube Music artists", "YouTube Music link", "Match", "Included"]];
+  for (const pl of state.review.playlists) {
+    pl.tracks.forEach((t, ti) => {
+      const sp = t.spotify, c = t.pick;
+      const match = !c ? "not found" : c.confidence === "manual" ? "your link" : t.ok ? `${c.confidence}, checked by you` : c.confidence;
+      rows.push([pl.name, ti + 1, sp.title, sp.artists.join(", "), sp.album, sp.id ? `https://open.spotify.com/track/${sp.id}` : "",
+        c?.title, c?.artists, c ? `https://music.youtube.com/watch?v=${c.videoId}` : "", match, c && t.sel ? "yes" : "no"]);
+    });
+  }
+  return "﻿" + rows.map((r) => r.map(csvCell).join(",")).join("\r\n");
+}
+const downloadMatches = () => downloadFile(`dubdeck-${new Date().toLocaleDateString("sv")}.csv`, matchesCsv(), "text/csv;charset=utf-8");
+$("#download-csv").addEventListener("click", downloadMatches);
 
 function statsLine(pl) {
   const c = counts(pl.tracks);
@@ -1015,46 +1325,90 @@ function statsLine(pl) {
     h("span", {}, h("span", { class: "led on", "aria-hidden": "true" }), `${c.selected.toLocaleString()} of ${plural(c.all, "song")} selected`),
     c.review ? h("span", {}, h("span", { class: "led amber", "aria-hidden": "true" }), `${c.review} to check`) : null,
     c.missing ? h("span", {}, h("span", { class: "led rec", "aria-hidden": "true" }), `${c.missing} not found`) : null,
-  ];
+  ].filter(Boolean);
+}
+
+// "Send to": a new playlist, the one this playlist went to last time, or any of the user's playlists.
+function targetSelect(pl, id, onPick) {
+  const sent = sentTo.get(pl);
+  const mine = (state.ytPlaylists || []).filter((p) => p.id !== sent?.playlistId);
+  const options = [h("option", { value: "", selected: !pl.target }, "A new playlist")];
+  if (sent) options.push(h("option", { value: sent.playlistId, selected: pl.target?.id === sent.playlistId }, `${clip(sent.title, 34)} (sent ${fmtDay(sent.at)})`));
+  if (mine.length) {
+    options.push(h("optgroup", { label: "Your YouTube playlists" },
+      ...mine.map((p) => h("option", { value: p.id, selected: pl.target?.id === p.id }, `${clip(p.title, 40)}${p.count != null ? ` (${p.count})` : ""}`))));
+  }
+  if (pl.target && pl.target.id !== sent?.playlistId && !mine.some((p) => p.id === pl.target.id)) {
+    options.push(h("option", { value: pl.target.id, selected: true }, clip(pl.target.title, 40)));
+  }
+  if (!gauth.signedIn()) options.push(h("option", { value: "__signin" }, "One of my playlists (sign in)…"));
+  const select = h("select", {
+    id,
+    onchange: async (e) => {
+      const v = e.target.value;
+      if (v === "__signin") {
+        e.target.value = pl.target?.id || "";
+        if (await gauth.signIn()) await loadYtPlaylists();
+        return;
+      }
+      const title = v === sent?.playlistId ? sent.title : (state.ytPlaylists || []).find((p) => p.id === v)?.title || pl.target?.title || "";
+      onPick(v ? { id: v, title } : null);
+    },
+  }, ...options);
+  select._onPick = onPick; // refreshTargets() rebuilds the list with the same callback
+  return select;
 }
 
 function jcard(pl, pi) {
-  const nameId = `pl-name-${pi}`, privId = `pl-priv-${pi}`, modeId = `pl-mode-${pi}`;
+  const nameId = `pl-name-${pi}`, privId = `pl-priv-${pi}`, modeId = `pl-mode-${pi}`, targetId = `pl-target-${pi}`;
   const stats = h("div", { class: "jcard-stats" }, statsLine(pl));
+  const like = pl.mode === "like";
+  const existing = !like && !!pl.target;
+  const redraw = () => {
+    const focused = card.contains(document.activeElement) ? document.activeElement.id : null;
+    saveReview();
+    card.replaceWith(jcard(pl, pi));
+    if (focused) document.getElementById(focused)?.focus(); // keep the keyboard on the select just changed
+  };
 
-  const privacy = h("select", { id: privId, onchange: (e) => { pl.privacy = e.target.value; saveReview(); } },
-    ...[["PRIVATE", "Private"], ["UNLISTED", "Unlisted"], ["PUBLIC", "Public"]].map(([v, l]) => h("option", { value: v, selected: pl.privacy === v }, l))
-  );
   const opts = h("div", { class: "jcard-opts" });
   if (pl.liked) {
-    const mode = h("select", {
-      id: modeId,
-      onchange: (e) => { pl.mode = e.target.value; privField.hidden = pl.mode === "like"; nameInput.disabled = pl.mode === "like"; saveReview(); },
-    },
-      h("option", { value: "playlist", selected: pl.mode === "playlist" }, "Make a playlist"),
-      h("option", { value: "like", selected: pl.mode === "like" }, "Like each song")
+    const mode = h("select", { id: modeId, onchange: (e) => { pl.mode = e.target.value; redraw(); } },
+      h("option", { value: "playlist", selected: !like }, "Make a playlist"),
+      h("option", { value: "like", selected: like }, "Like each song")
     );
     opts.append(h("div", { class: "field" }, h("label", { for: modeId, text: "On YouTube Music" }), mode));
   }
-  const privField = h("div", { class: "field", hidden: pl.mode === "like" }, h("label", { for: privId, text: "Visibility" }), privacy);
-  opts.append(privField);
+  if (!like) {
+    opts.append(h("div", { class: "field field-target" }, h("label", { for: targetId, text: "Send to" }),
+      targetSelect(pl, targetId, (target) => { pl.target = target; redraw(); })));
+  }
+  if (!like && !existing) {
+    const privacy = h("select", { id: privId, onchange: (e) => { pl.privacy = e.target.value; saveReview(); } },
+      ...[["PRIVATE", "Private"], ["UNLISTED", "Unlisted"], ["PUBLIC", "Public"]].map(([v, l]) => h("option", { value: v, selected: pl.privacy === v }, l))
+    );
+    opts.append(h("div", { class: "field" }, h("label", { for: privId, text: "Visibility" }), privacy));
+  }
   opts.append(h("button", {
     type: "button", class: "key key-small", "aria-expanded": String(!pl.collapsed),
-    onclick: () => { pl.collapsed = !pl.collapsed; saveReview(); card.replaceWith(jcard(pl, pi)); },
+    onclick: () => { pl.collapsed = !pl.collapsed; redraw(); },
   }, pl.collapsed ? "Show songs" : "Hide songs"));
 
   const nameInput = h("input", {
-    type: "text", id: nameId, value: pl.outName, maxlength: "150", disabled: pl.mode === "like",
+    type: "text", id: nameId, value: existing ? pl.target.title : pl.outName, maxlength: "150", disabled: like || existing,
     oninput: (e) => { pl.outName = e.target.value; saveReview(); },
   });
+  const label = like
+    ? `Liked one by one (from “${pl.name}”)`
+    : existing ? `Adding new songs to this playlist (from “${pl.name}”). Songs already in it are skipped.` : `New playlist name (from “${pl.name}”)`;
 
   const head = h("header", { class: "jcard-head" },
     coverFor(pl),
-    h("div", { class: "jcard-title" }, h("label", { class: "label", for: nameId, text: `New playlist name (from “${pl.name}”)` }), nameInput, stats),
+    h("div", { class: "jcard-title" }, h("label", { class: "label", for: nameId, text: label }), nameInput, stats),
     opts
   );
   const card = h("section", { class: "jcard", "aria-label": pl.name }, head);
-  if (!pl.collapsed) card.append(trackList(pl, pi, stats));
+  if (!pl.collapsed || state.songQuery) card.append(trackList(pl, pi, stats));
   return card;
 }
 
@@ -1101,41 +1455,62 @@ function durCell(t, cand) {
   );
 }
 
+// A triangle, or three bouncing bars while that song is playing.
+const playIcon = () => h("span", { class: "play-ico", "aria-hidden": "true" }, h("i"), h("i"), h("i"));
+
+function playYtButton(c, cls = "thumb thumb-play") {
+  const key = `yt:${c.videoId}`;
+  return h("button", {
+    type: "button", class: cls, "data-play": key, "aria-pressed": String(isPlaying(key)),
+    "aria-label": `Listen to ${c.title} on YouTube Music`, title: "Listen",
+    onclick: () => play("yt", c.videoId, c.title, c.artists),
+  }, c.thumbnail ? h("img", { src: c.thumbnail, alt: "", loading: "lazy", onerror: (e) => e.target.remove() }) : null, playIcon());
+}
+
 function trackRow(pl, pi, t, ti, stats) {
   const sp = t.spotify, c = t.pick;
   const key = `${pi}:${ti}`;
   const spUrl = sp.id ? `https://open.spotify.com/track/${sp.id}` : null;
+  const numText = String(ti + 1).padStart(2, "0");
+  const num = sp.id
+    ? h("button", {
+        type: "button", class: "num num-play", "data-play": `sp:${sp.id}`, "aria-pressed": String(isPlaying(`sp:${sp.id}`)),
+        "aria-label": `Listen to ${sp.title} on Spotify`, title: "Listen on Spotify",
+        onclick: () => play("sp", sp.id, sp.title, sp.artists.join(", ")),
+      }, h("span", { class: "n", text: numText }), playIcon())
+    : h("span", { class: "num", text: numText });
   const sideA = h("div", { class: "side side-a" },
     spUrl ? h("a", { class: "t-title", href: spUrl, target: "_blank", rel: "noopener", text: sp.title }) : h("span", { class: "t-title", text: sp.title }),
     h("span", { class: "t-sub", text: sp.artists.join(", ") })
   );
   const sideB = c
     ? h("div", { class: "side side-b" },
-        c.thumbnail ? h("img", { class: "thumb", src: c.thumbnail, alt: "", loading: "lazy" }) : h("span", { class: "thumb" }),
+        playYtButton(c),
         h("div", {},
           h("a", { class: "t-title", href: `https://music.youtube.com/watch?v=${c.videoId}`, target: "_blank", rel: "noopener", text: c.title }),
           h("span", { class: "t-sub" }, c.artists || (c.type === "video" ? "Video" : ""), c.album ? h("span", { class: "album", text: c.album }) : null)
         )
       )
-    : h("p", { class: "missing-note", text: t.error ? `Search failed: ${t.error}` : "No match found. Use Change to paste a link." });
+    : h("p", { class: "missing-note", text: t.error ? `Search failed: ${t.error}` : "No match found. Use Change to search or paste a link." });
 
-  const li = h("li", { class: `track${t.sel && c ? "" : " off"}` },
+  const li = h("li", { class: `track${t.sel && c ? "" : " off"}${t.ok && c && t.pick.confidence !== "high" ? " checked" : ""}` },
     h("input", {
       type: "checkbox", checked: t.sel && !!c, disabled: !c, "aria-label": `Include ${sp.title}`,
-      onchange: (e) => { t.sel = e.target.checked; refreshRow(); },
+      onchange: (e) => { t.sel = e.target.checked; t.ok = true; refreshRow(); },
     }),
-    h("span", { class: "num", text: String(ti + 1).padStart(2, "0") }),
+    num,
     sideA,
     meter(c),
     sideB,
     durCell(t, c),
     h("button", {
       type: "button", class: "key key-small key-ghost", "aria-expanded": String(state.openAlt === key),
-      onclick: () => { state.openAlt = state.openAlt === key ? null : key; refreshRow(true); },
+      onclick: () => { state.openAlt = state.openAlt === key ? null : key; refreshRow(state.openAlt === key ? ".chooser input:checked" : null); },
     }, state.openAlt === key ? "Close" : "Change")
   );
 
-  function refreshRow(toggledAlt = false) {
+  // `focus` is a selector inside the reopened chooser to put the keyboard back on.
+  function refreshRow(focus = null) {
     saveReview();
     const next = li.nextElementSibling;
     if (next && next.classList.contains("alts")) next.remove();
@@ -1144,7 +1519,7 @@ function trackRow(pl, pi, t, ti, stats) {
     if (state.openAlt === key) {
       const alt = altsRow(pl, pi, t, ti);
       fresh.after(alt);
-      if (toggledAlt) alt.querySelector("input")?.focus();
+      if (focus) alt.querySelector(focus)?.focus();
     }
     stats.replaceChildren(...statsLine(pl));
     renderFilterCounts();
@@ -1155,19 +1530,42 @@ function trackRow(pl, pi, t, ti, stats) {
 }
 
 function altsRow(pl, pi, t, ti) {
-  const name = `alt-${pi}-${ti}`;
-  const choose = (cand) => {
-    t.pick = cand;
-    t.sel = !!cand;
-    box.previousElementSibling?._refresh?.();
-  };
-  const cands = [...t.candidates];
+  const box = h("li", { class: "alts" });
+  box.append(chooser(t, { name: `alt-${pi}-${ti}`, onChange: (focus) => box.previousElementSibling?._refresh?.(focus) }));
+  return box;
+}
+
+const trackBody = (sp) => ({
+  id: sp.id || null, title: String(sp.title).slice(0, 500), artists: (sp.artists || []).slice(0, 30),
+  album: String(sp.album || "").slice(0, 500), duration_sec: sp.duration_sec || null, isrc: sp.isrc ? String(sp.isrc).slice(0, 20) : null,
+});
+
+// "Song (feat. X) [From Y] - Remastered 2011" searches better as "Song".
+const searchTitle = (s) => s.replace(/\s*[([][^)\]]*[)\]]/g, "").replace(/\s+[-–—]\s+.*$/, "").trim() || s;
+
+const mergeCands = (first, rest) => {
+  const seen = new Set();
+  return [...first, ...(rest || [])].filter((c) => c && !seen.has(c.videoId) && seen.add(c.videoId)).slice(0, 12);
+};
+
+// The versions to pick from, "Leave this song out", and a box that searches YouTube Music or takes a
+// link. Used under a song in the list and in Check one by one. `onChange(focus)` redraws it.
+function chooser(t, { name, onChange, keys = false }) {
+  const chosen = t.sel && t.pick ? t.pick.videoId : null;
+  const cands = [...(t.candidates || [])];
   if (t.pick && !cands.some((c) => c.videoId === t.pick.videoId)) cands.unshift(t.pick);
+
+  const choose = (cand) => {
+    if (cand) { t.pick = cand; t.sel = true; } else t.sel = false;
+    t.ok = true;
+    onChange(".alt input:checked");
+  };
 
   const options = cands.map((c, i) =>
     h("label", { class: "alt", for: `${name}-${i}` },
-      h("input", { type: "radio", name, id: `${name}-${i}`, checked: t.pick?.videoId === c.videoId, onchange: () => choose(c) }),
-      c.thumbnail ? h("img", { class: "thumb", src: c.thumbnail, alt: "", loading: "lazy" }) : h("span", { class: "thumb" }),
+      h("input", { type: "radio", name, id: `${name}-${i}`, checked: chosen === c.videoId, onchange: () => choose(c) }),
+      keys ? h("kbd", { class: "alt-key", "aria-hidden": "true", text: i < 9 ? String(i + 1) : "" }) : null,
+      playYtButton(c),
       h("span", { class: "side" },
         h("span", { class: "t-title", text: c.title }),
         h("span", { class: "t-sub" }, [c.artists, c.album, c.type === "video" ? "music video" : null].filter(Boolean).join(", "))
@@ -1178,37 +1576,234 @@ function altsRow(pl, pi, t, ti) {
   );
   options.push(
     h("label", { class: "alt none", for: `${name}-none` },
-      h("input", { type: "radio", name, id: `${name}-none`, checked: !t.pick, onchange: () => choose(null) }),
+      h("input", { type: "radio", name, id: `${name}-none`, checked: !chosen, onchange: () => choose(null) }),
+      keys ? h("kbd", { class: "alt-key", "aria-hidden": "true", text: "X" }) : null,
       h("span", { class: "t-sub", text: "Leave this song out" })
     )
   );
 
-  const urlId = `${name}-url`;
-  const form = h("form", { class: "inline-form", autocomplete: "off" },
-    h("div", { class: "field" }, h("label", { for: urlId, text: "Or paste a YouTube Music or YouTube link" }),
-      h("input", { type: "url", id: urlId, placeholder: "https://music.youtube.com/watch?v=…", required: true })),
-    h("button", { class: "key key-small", type: "submit" }, "Use this link")
+  const qId = `${name}-q`;
+  const fallback = [searchTitle(t.spotify.title), t.spotify.artists[0]].filter(Boolean).join(" ");
+  const input = h("input", { type: "search", id: qId, class: "chooser-q", placeholder: fallback, maxlength: "200", autocomplete: "off", spellcheck: "false", enterkeyhint: "search" });
+  const btn = h("button", { class: "key key-small", type: "submit" }, "Search");
+  const status = h("p", { class: "chooser-status", role: "status" });
+  const form = h("form", { class: "inline-form chooser-search", autocomplete: "off" },
+    h("div", { class: "field" }, h("label", { for: qId, text: "Search YouTube Music, or paste a YouTube link" }), input),
+    btn
   );
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const btn = form.querySelector("button");
+    const q = input.value.trim() || fallback;
+    const isLink = /^(https?:\/\/|www\.|(m\.|music\.)?youtube\.com\/|youtu\.be\/)/i.test(q);
     btn.disabled = true;
-    btn.textContent = "Looking up…";
+    btn.textContent = isLink ? "Looking up…" : "Searching…";
+    status.textContent = "";
     try {
-      const { candidate } = await api("/api/ytm/lookup", { method: "POST", body: { url: form.querySelector("input").value } });
-      choose(candidate);
+      if (isLink) {
+        const { candidate } = await api("/api/ytm/lookup", { method: "POST", body: { url: q } });
+        t.candidates = mergeCands([candidate], t.candidates);
+        // If the user moved on meanwhile, keep the result for that song but don't decide it or steal focus.
+        if (form.isConnected) choose(candidate);
+        else saveReview();
+        return;
+      }
+      const { candidates } = await api("/api/ytm/search", { method: "POST", body: { query: q, track: trackBody(t.spotify), region } });
+      if (!candidates.length) throw new Error(`Nothing on YouTube Music for “${q}”. Try fewer words.`);
+      t.candidates = mergeCands(candidates, t.candidates);
+      saveReview();
+      if (form.isConnected) onChange(".alt input");
     } catch (err) {
-      flash(err.message);
+      status.textContent = err.message;
       btn.disabled = false;
-      btn.textContent = "Use this link";
+      btn.textContent = "Search";
     }
   });
 
-  const box = h("li", { class: "alts" },
-    h("fieldset", { class: "alts-list" }, h("legend", { class: "sr-only", text: `Matches for ${t.spotify.title}` }), ...options),
-    form
+  return h("div", { class: "chooser" },
+    h("fieldset", { class: "alts-list" }, h("legend", { class: "sr-only", text: `Versions of ${t.spotify.title}` }), ...options),
+    form,
+    status
   );
-  return box;
+}
+
+// ------------------------------------------------------------------ check one by one
+
+const check = { queue: [], i: 0 };
+
+function openCheck() {
+  const queue = [];
+  state.review.playlists.forEach((pl, pi) => pl.tracks.forEach((t, ti) => needsCheck(t) && queue.push([pi, ti])));
+  if (!queue.length) return toast("Nothing left to check.");
+  check.queue = queue;
+  check.i = 0;
+  stopPlayer();
+  if (!$("#check").open) $("#check").showModal();
+  renderCheck();
+}
+
+function checkItem() {
+  const at = check.queue[check.i];
+  if (!at) return null;
+  const pl = state.review.playlists[at[0]];
+  return { pl, ti: at[1], t: pl.tracks[at[1]] };
+}
+
+function renderCheck(focus) {
+  const n = check.queue.length, it = checkItem();
+  $("#check-count").textContent = `${Math.min(check.i + 1, n)} of ${n}`;
+  $("#check-bar i").style.width = `${Math.round((check.i / n) * 100)}%`;
+  $("#check-foot").hidden = $("#check-keys").hidden = !it;
+  const body = $("#check-body");
+
+  if (!it) {
+    const left = check.queue.filter(([pi, ti]) => needsCheck(state.review.playlists[pi].tracks[ti])).length;
+    body.replaceChildren(h("div", { class: "check-end" },
+      h("p", { class: "check-song", text: left ? `${plural(left, "song")} skipped for now` : "All checked" }),
+      h("p", { class: "lede", text: left ? `${left === 1 ? "It's" : "They're"} still marked to check in the list.` : "Every song here has a decision. Transfer is at the bottom of the page when you're ready." }),
+      h("div", { class: "check-end-keys" },
+        left ? h("button", { type: "button", class: "key", onclick: () => openCheck() }, "Go through the skipped ones") : null,
+        h("button", { type: "button", class: "key key-primary", onclick: () => $("#check").close() }, "Back to the list")
+      )
+    ));
+    body.querySelector(".key-primary").focus();
+    return;
+  }
+
+  const { pl, ti, t } = it;
+  const sp = t.spotify;
+  const listenA = sp.id
+    ? h("button", {
+        type: "button", class: "key key-small listen", "data-play": `sp:${sp.id}`, "aria-pressed": String(isPlaying(`sp:${sp.id}`)),
+        onclick: () => play("sp", sp.id, sp.title, sp.artists.join(", ")),
+      }, playIcon(), "Listen")
+    : null;
+  const note = t.error
+    ? `The search failed (${t.error}). Try searching below.`
+    : !t.pick && !t.candidates?.length ? "Nothing close turned up. Search with other words, paste a link, or leave it out." : null;
+
+  body.replaceChildren(
+    h("section", { class: "check-side check-a", "aria-label": "Side A: the Spotify song" },
+      h("p", { class: "side-tag" }, h("b", { text: "A" }), `Spotify, “${clip(pl.name, 40)}” no. ${ti + 1}`),
+      h("div", { class: "check-a-row" },
+        h("div", { class: "check-a-text" },
+          h("p", { class: "check-song", text: sp.title }),
+          h("p", { class: "t-sub", text: [sp.artists.join(", "), sp.album, fmtTime(sp.duration_sec)].filter(Boolean).join(" · ") })
+        ),
+        listenA
+      )
+    ),
+    h("section", { class: "check-side check-b", "aria-label": "Side B: pick the YouTube Music version" },
+      h("p", { class: "side-tag" }, h("b", { text: "B" }), "YouTube Music: pick the same recording"),
+      note ? h("p", { class: "missing-note", text: note }) : null,
+      chooser(t, { name: "chk", keys: true, onChange: (f) => { saveReview(); renderCheck(f); } })
+    )
+  );
+  $("#check-keep").textContent = t.sel && t.pick ? "Keep this match" : "Leave it out";
+  $("#check-prev").disabled = check.i === 0;
+  renderPlayer();
+  ((focus && body.querySelector(focus)) || $("#check-keep")).focus();
+}
+
+function checkMove(d) {
+  stopPlayer();
+  check.i = Math.max(0, Math.min(check.queue.length, check.i + d));
+  renderCheck();
+}
+function checkDecide(keep) {
+  const it = checkItem();
+  if (!it) return;
+  if (!keep) it.t.sel = false;
+  it.t.ok = true;
+  saveReview();
+  checkMove(1);
+}
+function checkListen(side) {
+  const it = checkItem();
+  if (!it) return;
+  const { t } = it, sp = t.spotify;
+  if (side === "a" && sp.id) play("sp", sp.id, sp.title, sp.artists.join(", "));
+  if (side === "b" && t.pick) play("yt", t.pick.videoId, t.pick.title, t.pick.artists);
+}
+
+$("#check-prev").addEventListener("click", () => checkMove(-1));
+$("#check-skip").addEventListener("click", () => checkMove(1));
+$("#check-keep").addEventListener("click", () => checkDecide(true));
+$("#check-close").addEventListener("click", () => $("#check").close());
+$("#check").addEventListener("close", () => { stopPlayer(); renderReview(); });
+$("#check").addEventListener("keydown", (e) => {
+  if (!checkItem() || e.ctrlKey || e.metaKey || e.altKey) return;
+  const el = e.target, tag = el.tagName;
+  if ((tag === "INPUT" && el.type !== "radio" && el.type !== "checkbox") || tag === "TEXTAREA" || tag === "SELECT") return;
+  const k = e.key;
+  // A held key decides one song, not the whole queue.
+  if (e.repeat && k !== "ArrowLeft" && k !== "ArrowRight") {
+    if (k === "Enter") e.preventDefault(); // otherwise a held Enter keeps pressing the focused button
+    return;
+  }
+  if (k === "Enter" && (tag === "BUTTON" || tag === "A")) return; // the focused button does its own thing
+  if (k === "Enter") checkDecide(true);
+  else if (k === "ArrowRight") checkMove(1);
+  else if (k === "ArrowLeft") checkMove(-1);
+  else if (k === "x" || k === "X" || k === "0") checkDecide(false);
+  else if (/^[1-9]$/.test(k)) $$("#check-body .alt:not(.none) input")[Number(k) - 1]?.click();
+  else if (k === "a" || k === "A") checkListen("a");
+  else if (k === "b" || k === "B") checkListen("b");
+  else if (k === "/") $("#check-body .chooser-q")?.focus();
+  else return;
+  e.preventDefault();
+});
+
+// ------------------------------------------------------------------ player (A: Spotify, B: YouTube Music)
+
+const player = { src: null };
+const isPlaying = (key) => player.src?.key === key;
+
+function play(kind, id, title, sub) {
+  const key = `${kind}:${id}`;
+  if (isPlaying(key)) return stopPlayer();
+  player.src = { kind, id, key, title, sub };
+  renderPlayer();
+}
+function stopPlayer() {
+  if (!player.src) return;
+  player.src = null;
+  renderPlayer();
+}
+
+// One player at a time: docked at the bottom, or inside Check one by one while that's open.
+function renderPlayer() {
+  const inCheck = $("#check").open;
+  const host = inCheck ? $("#check-player") : $("#monitor");
+  const other = inCheck ? $("#monitor") : $("#check-player");
+  const s = player.src;
+  other.replaceChildren();
+  other.dataset.key = "";
+  if (!s) host.replaceChildren();
+  else if (host.dataset.key !== s.key) host.replaceChildren(playerView(s));
+  host.dataset.key = s?.key || "";
+  $("#monitor").hidden = inCheck || !s;
+  $$("[data-play]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.play === s?.key)));
+}
+
+function playerView(s) {
+  const yt = s.kind === "yt";
+  const src = yt
+    ? `https://www.youtube-nocookie.com/embed/${s.id}?autoplay=1&rel=0&playsinline=1`
+    : `https://open.spotify.com/embed/track/${s.id}?utm_source=dubdeck`;
+  const href = yt ? `https://music.youtube.com/watch?v=${s.id}` : `https://open.spotify.com/track/${s.id}`;
+  return h("div", { class: `player player-${s.kind}` },
+    h("div", { class: "player-head" },
+      h("span", { class: "player-side", "aria-hidden": "true", text: yt ? "B" : "A" }),
+      h("p", { class: "player-title" }, h("b", { text: s.title }), s.sub ? h("span", { text: ` · ${s.sub}` }) : null),
+      h("a", { class: "textbtn", href, target: "_blank", rel: "noopener" }, yt ? "Open in YouTube Music" : "Open in Spotify"),
+      h("button", { type: "button", class: "textbtn", onclick: stopPlayer }, "Stop")
+    ),
+    h("iframe", {
+      src, title: `${yt ? "YouTube" : "Spotify"} player: ${s.title}`,
+      allow: "autoplay; encrypted-media; clipboard-write; fullscreen; picture-in-picture",
+      referrerpolicy: "strict-origin-when-cross-origin",
+    })
+  );
 }
 
 // ------------------------------------------------------------------ transfer (resumable)
@@ -1224,16 +1819,24 @@ async function startTransfer() {
     const all = pl.tracks.filter((t) => t.sel && t.pick).map((t) => t.pick.videoId);
     if (!all.length) return;
     const ids = [...new Set(all)];
+    const like = pl.mode === "like";
+    const target = like ? null : pl.target;
     items.push({
       pi,
-      name: (pl.outName || pl.name).trim() || pl.name,
+      key: sentTo.key(pl),
+      name: target ? target.title : (pl.outName || pl.name).trim() || pl.name,
       description: [pl.description, "Copied from Spotify with Dubdeck."].filter(Boolean).join("\n\n"),
       privacy: pl.privacy,
       mode: pl.mode,
       ids,
       dupes: all.length - ids.length,
-      playlistId: null,
-      url: pl.mode === "like" ? "https://music.youtube.com/playlist?list=LM" : null,
+      playlistId: target?.id || null,
+      existing: !!target,
+      // Before adding to an existing playlist or liking, look at what's already there (cheap) so
+      // nothing is added twice (expensive). A new playlist has nothing to look at.
+      synced: !like && !target,
+      already: 0,
+      url: like ? LIKED_URL : target ? playlistUrl(target.id) : null,
       next: 0,
       added: 0,
       failed: [],
@@ -1245,7 +1848,17 @@ async function startTransfer() {
   runTransfer();
 }
 
+const LIKED_URL = "https://music.youtube.com/playlist?list=LM";
+const playlistUrl = (id) => `https://music.youtube.com/playlist?list=${id}`;
 const SKIPPABLE = new Set(["videoNotFound", "forbidden", "videoNotAvailable", "videoChartNotFound", "invalidVideoId", "videoRatingDisabled", "notFound"]);
+
+// What an error means for the whole transfer. Everything here stops it; most can be continued.
+function halt(T, e) {
+  if (e.reason === "quotaExceeded" || e.reason === "dailyLimitExceeded") Object.assign(T, { status: "paused", reason: "quota" });
+  else if (e.status === 401) Object.assign(T, { status: "paused", reason: "auth" });
+  else if (e.status === 0 || e.status >= 500 || TRANSIENT.has(e.reason)) Object.assign(T, { status: "paused", reason: "network" });
+  else Object.assign(T, { status: "error", message: friendlyYtError(e) });
+}
 
 async function runTransfer() {
   const T = state.transfer;
@@ -1264,66 +1877,115 @@ async function runTransfer() {
   setLabels("Spotify", T.items.length === 1 ? first.name : `${T.items.length} playlists`);
   show("transferring");
 
-  const total = T.items.reduce((a, it) => a + it.ids.length, 0);
-  let done = T.items.reduce((a, it) => a + it.next, 0);
+  const total = () => T.items.reduce((a, it) => a + it.ids.length, 0);
+  const done = () => T.items.reduce((a, it) => a + it.next, 0);
+  const progress = (label) => tick({ label, done: done(), total: total() });
 
   outer: for (const it of T.items) {
-    if (it.mode === "playlist" && !it.playlistId && it.next < it.ids.length) {
+    if (it.synced === false && it.ids.length) {
       if (state.run.cancelled) { T.status = "stopped"; break; }
-      tick({ label: `Creating playlist “${it.name}”…`, done, total });
+      progress(it.mode === "like" ? "Checking which songs you've already liked…" : `Checking what's already in “${it.name}”…`);
       try {
-        it.playlistId = await withRetry(() => yt.createPlaylist(it.name, it.description, it.privacy));
-        it.url = `https://music.youtube.com/playlist?list=${it.playlistId}`;
+        const have = it.mode === "like" ? await withRetry(() => yt.liked(it.ids)) : await withRetry(() => yt.itemIds(it.playlistId));
+        const before = it.ids.length;
+        it.ids = it.ids.filter((id) => !have.has(id));
+        it.already = before - it.ids.length;
+        it.synced = true;
+        if (it.existing) sentTo.put(it.key, { playlistId: it.playlistId, title: it.name });
         saveTransfer();
       } catch (e) {
-        if (e.reason === "quotaExceeded") { T.status = "paused"; T.reason = "quota"; break; }
-        if (e.status === 401) { T.status = "paused"; T.reason = "auth"; break; }
-        T.status = "error";
-        T.message = friendlyYtError(e);
+        if (it.existing && (e.reason === "playlistNotFound" || e.status === 404)) {
+          // Deleted on YouTube since last time: make a new playlist with the same name instead.
+          if (sentTo.all()[it.key]?.playlistId === it.playlistId) sentTo.drop(it.key);
+          Object.assign(it, { playlistId: null, url: null, existing: false, synced: true, gone: true });
+          saveTransfer();
+        } else {
+          halt(T, e);
+          break;
+        }
+      }
+    }
+    if (it.mode === "playlist" && !it.playlistId && it.next < it.ids.length) {
+      if (state.run.cancelled) { T.status = "stopped"; break; }
+      progress(`Creating playlist “${it.name}”…`);
+      try {
+        it.playlistId = await withRetry(() => yt.createPlaylist(it.name, it.description, it.privacy));
+        it.url = playlistUrl(it.playlistId);
+        sentTo.put(it.key, { playlistId: it.playlistId, title: it.name });
+        saveTransfer();
+      } catch (e) {
+        halt(T, e);
         break;
       }
     }
     while (it.next < it.ids.length) {
       if (state.run.cancelled) { T.status = "stopped"; break outer; }
       const vid = it.ids[it.next];
-      tick({ label: `${it.mode === "like" ? "Liking songs for" : "Adding songs to"} “${it.name}”…`, done, total });
+      progress(`${it.mode === "like" ? "Liking songs for" : "Adding songs to"} “${it.name}”…`);
       try {
         if (it.mode === "like") await withRetry(() => yt.like(vid));
-        else await withRetry(() => yt.addItem(it.playlistId, vid), { retryPlaylistNotFound: it.added === 0 });
+        else await withRetry(() => yt.addItem(it.playlistId, vid), { retryPlaylistNotFound: it.added === 0 && !it.existing });
         it.added++;
       } catch (e) {
-        if (e.reason === "quotaExceeded") { T.status = "paused"; T.reason = "quota"; break outer; }
-        if (e.status === 401) { T.status = "paused"; T.reason = "auth"; break outer; }
-        if (SKIPPABLE.has(e.reason)) {
-          it.failed.push(vid);
-        } else if (e.status === 0 || e.status >= 500 || TRANSIENT.has(e.reason)) {
-          T.status = "paused"; T.reason = "network"; break outer;
-        } else {
-          T.status = "error"; T.message = friendlyYtError(e); break outer;
-        }
+        if (!SKIPPABLE.has(e.reason)) { halt(T, e); break outer; }
+        it.failed.push(vid);
       }
       it.next++;
-      done++;
       saveTransfer();
     }
   }
   if (T.status === "running") T.status = "done";
   saveTransfer();
-  state.run = null;
-  setTape(T.status === "done" ? 1 : total ? done / total : 0, false);
+  endRun({ done: "Transfer finished", paused: "Transfer paused" }[T.status]);
+  setTape(T.status === "done" ? 1 : total() ? done() / total() : 0, false);
   setTransport({ done: "Done", paused: "Paused", stopped: "Stopped" }[T.status] || "Error");
   renderDone();
 }
 
-function untilQuotaReset() {
+// Google's quota resets at midnight Pacific time.
+function quotaReset() {
   const now = new Date();
   const pt = new Date(now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
   const midnight = new Date(pt);
   midnight.setHours(24, 0, 0, 0);
-  const ms = midnight - pt;
-  const at = new Date(now.getTime() + ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  return { hours: Math.max(1, Math.round(ms / 3_600_000)), at };
+  const ms = Math.max(0, midnight - pt);
+  return { ms, at: new Date(now.getTime() + ms) };
 }
+
+function reminderIcs() {
+  const start = new Date(quotaReset().at.getTime() + 5 * 60_000);
+  const stamp = (d) => d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const text = (s) => s.replace(/[\\;,]/g, (c) => "\\" + c);
+  return [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Dubdeck//Transfer reminder//EN", "CALSCALE:GREGORIAN",
+    "BEGIN:VEVENT",
+    `UID:${uid()}@dubdeck`,
+    `DTSTAMP:${stamp(new Date())}`,
+    `DTSTART:${stamp(start)}`,
+    `DTEND:${stamp(new Date(start.getTime() + 15 * 60_000))}`,
+    `SUMMARY:${text("Continue your Dubdeck transfer")}`,
+    `DESCRIPTION:${text(`Google's daily limit has reset. Open ${location.origin} in the same browser and press Continue transfer.`)}`,
+    `URL:${location.origin}/`,
+    "BEGIN:VALARM", "ACTION:DISPLAY", "TRIGGER:PT0M", `DESCRIPTION:${text("Continue your Dubdeck transfer")}`, "END:VALARM",
+    "END:VEVENT", "END:VCALENDAR", "",
+  ].join("\r\n");
+}
+
+let countdownTimer;
+function renderCountdown() {
+  const { ms, at } = quotaReset();
+  const mins = Math.ceil(ms / 60_000);
+  $("#countdown-h").textContent = String(Math.floor(mins / 60)).padStart(2, "0");
+  $("#countdown-m").textContent = String(mins % 60).padStart(2, "0");
+  const shared = !gauth.usingOwn() && !!state.config.google_client_id;
+  $("#paused-text").textContent =
+    `Google's daily limit is used up${shared ? " (this site's limit is shared by everyone using it)" : ""}. ` +
+    `It resets at midnight Pacific time, in ${mins >= 60 ? `about ${plural(Math.round(mins / 60), "hour")}` : plural(mins, "minute")} ` +
+    `(around ${at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} your time). ` +
+    "Your progress is saved in this browser: come back then and press Continue transfer.";
+}
+
+const itemFinished = (it) => it.synced !== false && it.next >= it.ids.length && (it.mode === "like" || !!it.playlistId || !it.ids.length);
 
 function renderDone() {
   const T = state.transfer;
@@ -1331,26 +1993,35 @@ function renderDone() {
   if (T.status === "running" && !state.run) { T.status = "paused"; T.reason = "interrupted"; saveTransfer(); }
   const total = T.items.reduce((a, it) => a + it.ids.length, 0);
   const added = T.items.reduce((a, it) => a + it.added, 0);
-  const processed = T.items.reduce((a, it) => a + it.next, 0);
+  const already = T.items.reduce((a, it) => a + (it.already || 0), 0);
   setCounter(added);
 
   $("#done-title").textContent = { done: "Transfer finished", paused: "Transfer paused", stopped: "Transfer stopped" }[T.status] || "Transfer stopped early";
-  $("#done-lede").textContent = `${added.toLocaleString()} of ${plural(total, "song")} added to YouTube Music.${T.status === "done" ? " Playlists can take a minute to appear in your library." : ""}`;
+  $("#done-lede").textContent = [
+    `${added.toLocaleString()} of ${plural(total, "song")} added to YouTube Music.`,
+    already ? `${plural(already, "song")} ${already === 1 ? "was" : "were"} already there, so ${already === 1 ? "it was" : "they were"} skipped.` : "",
+    T.status === "done" ? "Playlists can take a minute to appear in your library." : "",
+  ].filter(Boolean).join(" ");
 
-  const unfinished = processed < total || T.items.some((it) => it.mode === "playlist" && !it.playlistId && it.ids.length);
+  const unfinished = T.items.some((it) => !itemFinished(it));
+  const quota = unfinished && T.reason === "quota";
   $("#paused").hidden = !unfinished;
-  if (unfinished) {
+  $("#countdown").hidden = $("#remind").hidden = !quota;
+  $("#own-project-quota").hidden = !quota || gauth.usingOwn() || !state.config.google_client_id;
+  clearInterval(countdownTimer);
+  if (quota) {
+    renderCountdown();
+    countdownTimer = setInterval(() => (state.view === "done" ? renderCountdown() : clearInterval(countdownTimer)), 20_000);
+  } else if (unfinished) {
     let text;
-    if (T.reason === "quota") {
-      const { hours, at } = untilQuotaReset();
-      text = `Google's daily limit for this app is used up. It resets at midnight Pacific time, in about ${plural(hours, "hour")} (around ${at} your time). Your progress is saved in this browser: come back then and press Continue transfer.`;
-    } else if (T.reason === "auth") text = "Sign in with Google to carry on. Press Continue transfer.";
+    if (T.reason === "auth") text = "Sign in with Google to carry on. Press Continue transfer.";
     else if (T.reason === "network") text = "Lost the connection to YouTube. Press Continue transfer to retry from where it stopped.";
     else if (T.reason === "interrupted") text = "The page was closed during the transfer. Press Continue transfer to pick up where it stopped.";
     else if (T.status === "stopped") text = "You stopped the transfer. Press Continue transfer to carry on.";
     else text = `${T.message || "Something went wrong."} Press Continue transfer to try again.`;
     $("#paused-text").textContent = text;
   }
+  if (!document.hidden) document.title = quota ? `Paused · ${BASE_TITLE}` : BASE_TITLE; // keep endRun's note in a background tab
 
   $("#results").replaceChildren(
     ...T.items.map((it) => {
@@ -1360,15 +2031,21 @@ function renderDone() {
       const missed = pl
         ? pl.tracks.filter((t) => !t.pick || !t.sel || failed.has(t.pick.videoId)).map((t) => `${t.spotify.artists.join(", ")} - ${t.spotify.title}`)
         : [];
-      const meta = it.mode === "like"
-        ? `${plural(it.added, "song")} liked of ${it.ids.length.toLocaleString()}`
-        : `${it.added.toLocaleString()} of ${plural(it.ids.length, "song")} added${it.dupes ? `, ${plural(it.dupes, "duplicate")} skipped` : ""}`;
+      const parts = it.mode === "like"
+        ? [`${plural(it.added, "song")} liked of ${it.ids.length.toLocaleString()}`]
+        : [`${it.added.toLocaleString()} of ${plural(it.ids.length, it.existing ? "new song" : "song")} added`];
+      if (it.already) parts.push(`${it.already.toLocaleString()} already there`);
+      if (it.dupes) parts.push(`${plural(it.dupes, "duplicate")} skipped`);
+      let meta = parts.join(", ") + ".";
+      if (pending.size) meta += ` ${plural(pending.size, "song")} still to go.`;
+      if (it.gone) meta += " The playlist it went to last time was deleted, so this is a new one.";
       const panel = h("article", { class: "panel result" },
         h("div", { class: "result-head" },
-          h("div", {}, h("p", { class: "result-name", text: it.name }), h("p", { class: "result-meta", text: pending.size ? `${meta}. ${plural(pending.size, "song")} still to go.` : meta })),
+          h("div", {}, h("p", { class: "result-name", text: it.name }), h("p", { class: "result-meta", text: meta })),
           it.url ? h("a", { class: "key key-primary", href: it.url, target: "_blank", rel: "noopener" }, it.mode === "like" ? "Open liked music" : "Open in YouTube Music") : null
         ),
-        h("div", { class: "bar", role: "img", "aria-label": `${it.added} of ${it.ids.length} added` }, h("i", { style: `width:${it.ids.length ? Math.round((it.added / it.ids.length) * 100) : 0}%` }))
+        h("div", { class: "bar", role: "img", "aria-label": `${it.added} of ${it.ids.length} added` },
+          h("i", { style: `width:${it.ids.length ? Math.round((it.added / it.ids.length) * 100) : 100}%` }))
       );
       if (missed.length) {
         panel.append(
@@ -1382,10 +2059,14 @@ function renderDone() {
       return panel;
     })
   );
+  $("#download-csv-done").hidden = !state.review;
   show("done");
 }
 
 $("#resume").addEventListener("click", () => runTransfer());
+$("#remind").addEventListener("click", () => downloadFile("dubdeck-reminder.ics", reminderIcs(), "text/calendar;charset=utf-8"));
+$("#own-project-quota").addEventListener("click", () => showGoogleSetup());
+$("#download-csv-done").addEventListener("click", downloadMatches);
 
 $("#start-over").addEventListener("click", (e) => {
   const b = e.currentTarget;

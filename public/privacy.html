@@ -27,7 +27,7 @@
   <main class="wrap">
     <div class="view-head">
       <h1 class="prose-title">Privacy and terms</h1>
-      <p class="lede">Last updated 24 November 2026.</p>
+      <p class="lede">Last updated 25 November 2026.</p>
     </div>
 
     <article class="panel prose">
@@ -38,11 +38,13 @@
       <p>Dubdeck uses YouTube API Services to put your playlists on YouTube Music. When you choose <b>Sign in</b>, Google asks you to let Dubdeck manage your YouTube account. With that permission, Dubdeck does only these things, and only when you press Transfer:</p>
       <ul>
         <li>reads the name of your YouTube channel, to show which account you signed in with;</li>
+        <li>reads the names of your playlists, so you can choose one to add songs to;</li>
         <li>creates the playlists you chose to transfer;</li>
+        <li>before adding songs to a playlist you already have, reads which songs are in it, and before liking songs, reads which of them you've already liked, so nothing is added twice;</li>
         <li>adds the matched songs to those playlists;</li>
         <li>likes songs, if you chose to send a playlist to your liked music instead.</li>
       </ul>
-      <p>Dubdeck doesn't read your existing playlists, watch history, subscriptions or comments, and it doesn't change or delete anything that's already in your account.</p>
+      <p>Dubdeck doesn't read your watch history, subscriptions or comments. It only adds: it doesn't change, reorder or delete anything that's already in your account.</p>
       <p>The sign-in happens between your browser and Google. Google gives your browser a temporary access token that lasts about an hour. It is kept in your browser's local storage and sent only to Google. It never reaches Dubdeck's server, so the people who run Dubdeck can't see it or use it.</p>
 
       <h2>What Dubdeck's server sees</h2>
@@ -50,13 +52,14 @@
       <ul>
         <li>the Spotify playlist, album, song or profile links you paste;</li>
         <li>the title, artists, album and length of each song being matched;</li>
+        <li>anything you type into the search box when picking a different version of a song;</li>
         <li>a two-letter country code taken from your browser's language, so search results fit your region.</li>
       </ul>
       <p>The server uses them to answer the request and then forgets them. Files you upload are read in your browser and are not sent anywhere.</p>
       <p>Dubdeck is hosted on Vercel, which keeps short-lived technical logs of requests (such as IP address, time and the page requested), as every web host does. Dubdeck doesn't use those logs to identify anyone.</p>
 
       <h2>What is kept in your browser</h2>
-      <p>Dubdeck saves the playlists you added, your match choices, the progress of a transfer, the name of your YouTube channel and the temporary Google token in this browser's local storage. That is how a transfer can carry on the next day. Clearing this site's data in your browser removes all of it.</p>
+      <p>Dubdeck saves the playlists you added, your match choices, the progress of a transfer, which YouTube playlist each Spotify playlist went to, your colour setting, the name of your YouTube channel and the temporary Google token in this browser's local storage. That is how a transfer can carry on the next day. Clearing this site's data in your browser removes all of it.</p>
 
       <h2>What Dubdeck doesn't do</h2>
       <ul>
@@ -65,6 +68,7 @@
         <li>No use of your data to train AI models.</li>
       </ul>
       <p>The page loads its fonts from Google Fonts and the sign-in button from Google, so Google receives the ordinary request for those files.</p>
+      <p>When you press a song's number or cover to listen to it, the page loads Spotify's player or YouTube's player (from youtube-nocookie.com) for that one song. Those players come from Spotify and Google and follow their own privacy policies. Nothing loads from them until you press play.</p>
 
       <h2>Taking back access</h2>
       <p>Choose <b>Sign out</b> in Dubdeck to cancel the token straight away. You can also remove Dubdeck from your Google account at any time on Google's <a href="https://myaccount.google.com/connections" target="_blank" rel="noopener">third-party connections page</a>. Playlists Dubdeck already created stay in your YouTube account until you delete them there.</p>

@@ -6,7 +6,9 @@ Two layers, neither an official API, so either can change without notice:
    up to 100 songs, without ISRCs.
 2. The embed page also carries a short-lived anonymous token, the one the widget itself
    uses. With it Spotify answers for whole playlists, song details in batches of 50 (with
-   ISRC and album) and the public playlists on a profile.
+   ISRC and album) and the public playlists on a profile. The batch endpoint has a daily
+   quota for this token; when it runs out, song details come one at a time from the
+   metadata endpoint the Spotify clients use, which has the same fields.
 
 Layer 2 is an upgrade, never a requirement: when it fails, callers fall back to layer 1.
 Private playlists and Liked Songs are out of reach for both.
@@ -37,7 +39,10 @@ MAX_PLAYLIST_TRACKS = 5000  # also YouTube's cap for one playlist
 MAX_USER_PLAYLISTS = 500
 _API = "https://api.spotify.com/v1"
 _PLAYLIST_API = "https://spclient.wg.spotify.com/playlist/v2/playlist"
+_METADATA_API = "https://spclient.wg.spotify.com/metadata/4/track"
 _TOKEN_SEED = ("track", "4u7EnebtmKWzUH433cf5Qv")  # any public embed page hands out a token
+_B62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_MAX_BLOCK = 6 * 3600  # never trust a Retry-After for longer than this
 
 
 class SpotifyPublicError(Exception):
@@ -48,6 +53,14 @@ class SpotifyPublicError(Exception):
 
 class _Unavailable(Exception):
     """The anonymous-token route didn't answer. Callers fall back to the embed page."""
+
+
+class _RateLimited(_Unavailable):
+    """Spotify said 429 and asked us to wait longer than is worth waiting inside a request."""
+
+    def __init__(self, retry_after: float):
+        super().__init__(f"rate limited for {retry_after:.0f}s")
+        self.retry_after = retry_after
 
 
 class _LRU(OrderedDict):
@@ -75,6 +88,8 @@ _track_cache = _LRU(5000)
 _local = threading.local()
 _token = {"value": None, "expires": 0.0}
 _token_lock = threading.Lock()
+_batch_blocked_until = {"tracks": 0.0, "metadata": 0.0}  # endpoints out of quota, skipped until then
+_block_lock = threading.Lock()
 
 
 def _session() -> requests.Session:
@@ -183,7 +198,7 @@ def _api_get(url: str, params: dict | None = None) -> dict | None:
             if wait.isdigit() and int(wait) <= 3:
                 time.sleep(int(wait) + 0.2)
                 continue
-            raise _Unavailable("rate limited")
+            raise _RateLimited(float(wait) if wait.isdigit() else 60.0)
         if r.status_code >= 500:
             time.sleep(0.6 * (attempt + 1))
             continue
@@ -208,21 +223,68 @@ def _from_api(id_: str, t: dict) -> dict | None:
     }
 
 
-def _api_tracks(ids: list[str]) -> tuple[dict[str, dict], set[str]]:
-    """Song details, 50 per request. Returns (found by id, ids Spotify gave no answer for).
+def _gid(id_: str) -> str:
+    """A base-62 Spotify id as the 32-digit hex id the metadata endpoint wants."""
+    n = 0
+    for c in id_:
+        n = n * 62 + _B62.index(c)
+    return f"{n:032x}"
 
-    An id in neither is one Spotify answered with "no such song".
+
+def _from_metadata(id_: str, t: dict) -> dict | None:
+    if not t.get("name"):
+        return None
+    isrc = next((x.get("id") for x in t.get("external_id") or [] if x.get("type") == "isrc"), None)
+    return {
+        "id": id_,
+        "title": t["name"],
+        "artists": [a["name"] for a in t.get("artist") or [] if a.get("name")],
+        "album": (t.get("album") or {}).get("name") or "",
+        "duration_sec": (t.get("duration") or 0) / 1000 or None,
+        "isrc": (isrc or "").upper() or None,
+    }
+
+
+_NO_ANSWER = object()
+METADATA_DEADLINE = 40.0  # seconds; past this the rest count as unanswered, so a request can't run on
+
+
+def _metadata_track(id_: str):
+    """One song from the metadata endpoint: a dict, or _NO_ANSWER.
+
+    A 404 counts as no answer, not as "no such song": this endpoint is undocumented, so a miss
+    here should fall back to the embed page rather than drop the song.
     """
-    unique = list(dict.fromkeys(ids))
+    try:
+        data = _api_get(f"{_METADATA_API}/{_gid(id_)}", {"market": "from_token"})
+    except _RateLimited as e:
+        _block("metadata", e.retry_after)
+        return _NO_ANSWER
+    except _Unavailable:
+        return _NO_ANSWER
+    return (_from_metadata(id_, data) if data else None) or _NO_ANSWER
+
+
+def _block(name: str, retry_after: float) -> None:
+    until = time.time() + min(retry_after, _MAX_BLOCK)
+    with _block_lock:
+        _batch_blocked_until[name] = max(_batch_blocked_until.get(name, 0.0), until)
+
+
+def _batch_tracks(ids: list[str]) -> tuple[dict[str, dict], set[str]]:
+    """Song details from /v1/tracks, 50 per request."""
     found: dict[str, dict] = {}
     unanswered: set[str] = set()
-    if not unique:
-        return found, unanswered
-    chunks = [unique[i : i + 50] for i in range(0, len(unique), 50)]
+    if time.time() < _batch_blocked_until["tracks"]:
+        return found, set(ids)
+    chunks = [ids[i : i + 50] for i in range(0, len(ids), 50)]
 
     def one(chunk: list[str]) -> list | None:
         try:
             data = _api_get(f"{_API}/tracks", {"ids": ",".join(chunk)})
+        except _RateLimited as e:
+            _block("tracks", e.retry_after)
+            return None
         except _Unavailable:
             return None
         rows = (data or {}).get("tracks")
@@ -237,7 +299,39 @@ def _api_tracks(ids: list[str]) -> tuple[dict[str, dict], set[str]]:
                 t = _from_api(id_, row) if row else None
                 if t:
                     found[id_] = t
-                    _track_cache.put(id_, t)
+    return found, unanswered
+
+
+def _api_tracks(ids: list[str], workers: int = 16) -> tuple[dict[str, dict], set[str]]:
+    """Song details with ISRCs. Returns (found by id, ids Spotify gave no answer for).
+
+    An id in neither is one Spotify answered with "no such song". Batches of 50 come first;
+    whatever they didn't answer (usually because the token's daily quota for them is used up)
+    is asked for one song at a time from the metadata endpoint.
+    """
+    unique = list(dict.fromkeys(ids))
+    if not unique:
+        return {}, set()
+    found, unanswered = _batch_tracks(unique)
+    rest = [i for i in unique if i in unanswered]
+    if rest and time.time() >= _batch_blocked_until["metadata"]:
+        unanswered = set()
+        deadline = time.time() + METADATA_DEADLINE
+
+        def one(id_: str):
+            # Once Spotify rate-limits this endpoint too, or time runs out, stop asking.
+            if time.time() > deadline or time.time() < _batch_blocked_until["metadata"]:
+                return _NO_ANSWER
+            return _metadata_track(id_)
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(rest))) as pool:
+            for id_, t in zip(rest, pool.map(one, rest)):
+                if t is _NO_ANSWER:
+                    unanswered.add(id_)
+                else:
+                    found[id_] = t
+    for id_, t in found.items():
+        _track_cache.put(id_, t)
     return found, unanswered
 
 
@@ -348,7 +442,9 @@ def collection(kind: str, id_: str) -> dict:
             truncated = len(full["ids"]) > MAX_PLAYLIST_TRACKS
             ids = full["ids"][:MAX_PLAYLIST_TRACKS]
             description = full["description"]
-    found, unanswered = _api_tracks(ids)
+    cached = {i: c for i in ids if (c := _track_cache.get_(i)) and c.get("isrc")}
+    found, unanswered = _api_tracks([i for i in ids if i not in cached])
+    found.update(cached)
     out_tracks = [t for t in (found.get(i) or from_embed.get(i) for i in ids) if t]
     if any(i in unanswered and i not in from_embed for i in ids):
         truncated = True  # these songs are in the playlist, but Spotify wouldn't describe them

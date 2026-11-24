@@ -106,6 +106,28 @@ def match_many(tracks: list[SpotifyTrack], region: str | None = None, workers: i
         return list(pool.map(work, tracks))
 
 
+def search(query: str, track: SpotifyTrack, region: str | None = None) -> list[dict]:
+    """A search the user typed: songs first, then videos, in YouTube Music's own order.
+
+    Each result is still scored against the Spotify song so the meter means the same thing
+    everywhere, but nothing is re-ranked: the user asked for these words.
+    """
+    query = re.sub(r"\s+", " ", query or "").strip()
+    if not query:
+        raise YTMError("Type something to search for.")
+
+    def run(filter_: str, top: int) -> list[dict]:
+        found = _retry(client(region).search, query, filter=filter_, limit=10)
+        return [r for r in found if r.get("videoId")][:top]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:  # one client per thread: sessions aren't thread-safe
+        songs, videos = pool.map(lambda a: run(*a), [("songs", 6), ("videos", 4)])
+    out: dict[str, dict] = {}
+    for r in songs + videos:
+        out.setdefault(r["videoId"], _candidate(r, score_candidate(track, r), "search"))
+    return list(out.values())
+
+
 def lookup(url_or_id: str) -> dict:
     """Resolve a pasted YouTube / YouTube Music link to a candidate."""
     s = (url_or_id or "").strip()

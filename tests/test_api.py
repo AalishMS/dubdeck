@@ -3,6 +3,8 @@ from fastapi.testclient import TestClient
 
 from app import main, spotify_public, ytm
 
+REAL_API_GET = spotify_public._api_get  # the autouse fixture below replaces it
+
 
 @pytest.fixture
 def client():
@@ -41,6 +43,8 @@ def no_spotify_network(monkeypatch):
         raise spotify_public._Unavailable("offline in tests")
 
     spotify_public._track_cache.clear()
+    monkeypatch.setitem(spotify_public._batch_blocked_until, "tracks", 0.0)
+    monkeypatch.setitem(spotify_public._batch_blocked_until, "metadata", 0.0)
     monkeypatch.setattr(spotify_public, "_api_get", down)
 
 
@@ -102,20 +106,47 @@ def api_track(id_, name, isrc):
     }
 
 
-def fake_spotify(playlist_ids, missing=(), fail_tracks=False):
-    """Stands in for _api_get: one playlist, song details by id, and one profile."""
+def metadata_track(id_, name, isrc):
+    """The shape spclient's metadata endpoint answers with."""
+    return {
+        "name": name,
+        "artist": [{"name": "Artist"}],
+        "album": {"name": "Album"},
+        "duration": 180000,
+        "external_id": [{"type": "isrc", "id": isrc}],
+    }
+
+
+def fake_spotify(playlist_ids, missing=(), fail_tracks=False, metadata=False, calls=None):
+    """Stands in for _api_get: one playlist, song details by id, and one profile.
+
+    fail_tracks: True makes /v1/tracks unavailable, "quota" makes it say 429 for a day.
+    metadata: whether the one-song metadata endpoint answers.
+    """
+    calls = calls if calls is not None else []
+    known = {spotify_public._gid(i): i for i in playlist_ids if ":" not in i}
 
     def get(url, params=None):
         params = params or {}
+        calls.append(url)
         if "/playlist/v2/playlist/" in url:
             start = params.get("from", 0)
             page = playlist_ids[start : start + 150]  # smaller than the playlist, to exercise paging
             items = [{"uri": u if ":" in u else f"spotify:track:{u}"} for u in page]
             return {"length": len(playlist_ids), "attributes": {"description": "Rock &amp; <a href='x'>roll</a>"}, "contents": {"items": items}}
         if url.endswith("/tracks"):
+            if fail_tracks == "quota":
+                raise spotify_public._RateLimited(83000)
             if fail_tracks:
                 raise spotify_public._Unavailable("rate limited")
             return {"tracks": [None if i in missing else api_track(i, f"Song {i[-3:]}", f"us{i[-3:]}") for i in params["ids"].split(",")]}
+        if "/metadata/4/track/" in url:
+            if metadata == "quota":
+                raise spotify_public._RateLimited(3600)
+            if not metadata:
+                raise spotify_public._Unavailable("offline in tests")
+            i = known.get(url.rsplit("/", 1)[-1])
+            return None if i is None or i in missing else metadata_track(i, f"Song {i[-3:]}", f"us{i[-3:]}")
         if url.endswith("/users/aalish"):
             return {"display_name": "Aalish"}
         if url.endswith("/users/aalish/playlists"):
@@ -152,6 +183,74 @@ def test_playlist_link_says_when_songs_could_not_be_read(client, monkeypatch):
     body = client.post("/api/spotify/collection", json={"kind": "playlist", "id": "37i9dQZF1DX4UtSsGT1Sbe"}).json()
     assert [t["title"] for t in body["tracks"]] == ["Mr. Brightside"]  # only the song the embed page described
     assert body["maybe_truncated"] is True
+
+
+def test_gid_matches_spotifys_hex_ids():
+    assert spotify_public._gid("003vvx7Niy0yvhvHt4a68B") == "0007ad33dd9041698f5749da79d310bd"
+
+
+def test_whole_playlist_still_comes_over_when_batch_quota_is_used_up(client, monkeypatch):
+    ids = song_ids(240)
+    calls = []
+    monkeypatch.setattr(spotify_public, "_entity", lambda kind, i: PLAYLIST_ENTITY)
+    monkeypatch.setattr(spotify_public, "_api_get", fake_spotify(ids, fail_tracks="quota", metadata=True, calls=calls))
+    body = client.post("/api/spotify/collection", json={"kind": "playlist", "id": "37i9dQZF1DX4UtSsGT1Sbe"}).json()
+    assert [t["id"] for t in body["tracks"]] == ids
+    assert body["tracks"][0] == {"id": ids[0], "title": "Song 000", "artists": ["Artist"], "album": "Album", "duration_sec": 180.0, "isrc": "US000"}
+    assert body["maybe_truncated"] is False
+
+    # Spotify said to come back tomorrow (clamped to a few hours), so the next request skips the batch endpoint.
+    import time
+    assert time.time() < spotify_public._batch_blocked_until["tracks"] <= time.time() + spotify_public._MAX_BLOCK
+    batch_calls = sum(u.endswith("/tracks") for u in calls)
+    spotify_public._track_cache.clear()
+    client.post("/api/spotify/tracks", json={"ids": ids[:2]})
+    assert sum(u.endswith("/tracks") for u in calls) == batch_calls
+
+
+def test_metadata_miss_falls_back_to_the_embed_page(client, monkeypatch):
+    ids = song_ids(2)
+    monkeypatch.setattr(spotify_public, "_api_get", fake_spotify(ids, missing={ids[1]}, fail_tracks="quota", metadata=True))
+    monkeypatch.setattr(spotify_public, "_entity", lambda kind, i: TRACK_ENTITY if i == ids[1] else pytest.fail("only the miss goes to its embed page"))
+    first, second = client.post("/api/spotify/tracks", json={"ids": ids}).json()["tracks"]
+    assert first["isrc"] == "US000"
+    assert second["title"] == "Mr. Brightside" and second["isrc"] is None
+
+
+def test_metadata_rate_limit_stops_asking(client, monkeypatch):
+    ids = song_ids(120)
+    calls = []
+    monkeypatch.setattr(spotify_public, "_entity", lambda kind, i: PLAYLIST_ENTITY)
+    monkeypatch.setattr(spotify_public, "_api_get", fake_spotify(ids, fail_tracks="quota", metadata="quota", calls=calls))
+    body = client.post("/api/spotify/collection", json={"kind": "playlist", "id": "37i9dQZF1DX4UtSsGT1Sbe"}).json()
+    assert [t["title"] for t in body["tracks"]] == []  # none of these ids are on the embed page
+    assert body["maybe_truncated"] is True
+    assert sum("/metadata/4/track/" in u for u in calls) < len(ids)  # it stopped once Spotify said 429
+
+
+class FakeResponse:
+    def __init__(self, status, headers=None, body=None):
+        self.status_code, self.headers, self._body = status, headers or {}, body
+
+    def json(self):
+        return self._body
+
+
+@pytest.mark.parametrize(("header", "expected"), [("83357", 83357.0), (None, 60.0)])
+def test_api_get_reports_long_rate_limits(monkeypatch, header, expected):
+    monkeypatch.setattr(spotify_public, "_anon_token", lambda refresh=False: "token")
+    resp = FakeResponse(429, {"Retry-After": header} if header else {})
+    monkeypatch.setattr(spotify_public, "_session", lambda: type("S", (), {"get": lambda self, *a, **k: resp})())
+    with pytest.raises(spotify_public._RateLimited) as e:
+        REAL_API_GET("https://api.spotify.com/v1/tracks")
+    assert e.value.retry_after == expected
+
+
+def test_api_get_waits_out_a_short_rate_limit(monkeypatch):
+    answers = [FakeResponse(429, {"Retry-After": "0"}), FakeResponse(200, body={"ok": True})]
+    monkeypatch.setattr(spotify_public, "_anon_token", lambda refresh=False: "token")
+    monkeypatch.setattr(spotify_public, "_session", lambda: type("S", (), {"get": lambda self, *a, **k: answers.pop(0)})())
+    assert REAL_API_GET("https://api.spotify.com/v1/tracks") == {"ok": True}
 
 
 def test_tracks_come_in_batches_and_fall_back_to_embeds(client, monkeypatch):
@@ -208,6 +307,40 @@ def test_match_passes_tracks_and_region(client, monkeypatch):
 def test_region_falls_back_when_unsupported():
     assert ytm.client("IN").context["context"]["client"]["gl"] == "IN"
     ytm.client("ZZ")  # unsupported: no error, default region
+
+
+class FakeYTM:
+    def search(self, query, filter=None, limit=10):
+        songs = [
+            {"videoId": "aaaaaaaaaaa", "title": "Mr. Brightside", "artists": [{"name": "The Killers"}], "duration_seconds": 223, "resultType": "song"},
+            {"videoId": "bbbbbbbbbbb", "title": "Mr. Brightside (Live)", "artists": [{"name": "The Killers"}], "duration_seconds": 250, "resultType": "song"},
+            {"title": "An artist page, no videoId"},
+        ]
+        videos = [
+            {"videoId": "ccccccccccc", "title": "The Killers - Mr. Brightside (Official Video)", "artists": [{"name": "The Killers"}], "duration_seconds": 228, "resultType": "video"},
+            {"videoId": "aaaaaaaaaaa", "title": "Mr. Brightside", "artists": [{"name": "The Killers"}], "duration_seconds": 223, "resultType": "video"},
+        ]
+        return songs if filter == "songs" else videos
+
+
+def test_search_keeps_youtubes_order_and_scores_each_result(client, monkeypatch):
+    monkeypatch.setattr(ytm, "client", lambda region=None: FakeYTM())
+    track = {"id": "003vvx7Niy0yvhvHt4a68B", "title": "Mr. Brightside", "artists": ["The Killers"], "duration_sec": 222.9}
+    r = client.post("/api/ytm/search", json={"query": "  brightside   killers ", "track": track, "region": "GB"})
+    cands = r.json()["candidates"]
+    assert r.status_code == 200
+    assert [c["videoId"] for c in cands] == ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"]  # songs first, no duplicates
+    assert cands[0]["confidence"] == "high" and cands[1]["confidence"] != "high"
+    assert cands[2]["type"] == "video" and cands[0]["method"] == "search"
+
+
+def test_search_validates_input(client):
+    track = {"title": "Song", "artists": ["A"]}
+    assert client.post("/api/ytm/search", json={"query": "", "track": track}).status_code == 422
+    assert client.post("/api/ytm/search", json={"query": "x" * 201, "track": track}).status_code == 422
+    assert client.post("/api/ytm/search", json={"query": "song"}).status_code == 422
+    r = client.post("/api/ytm/search", json={"query": "   ", "track": track})
+    assert r.status_code == 400 and "search" in r.json()["detail"]
 
 
 def test_lookup_rejects_garbage(client):

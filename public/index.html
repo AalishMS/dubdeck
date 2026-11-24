@@ -5,6 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Dubdeck</title>
   <meta name="description" content="Copy your Spotify playlists to YouTube Music. No Spotify login needed.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Dubdeck: copy Spotify playlists to YouTube Music">
+  <meta property="og:description" content="Paste a Spotify link, check the matches, send them to YouTube Music. No Spotify login, no Premium.">
+  <meta property="og:image" content="https://dubdeck-lime.vercel.app/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="theme-color" content="#d4d7d2" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#2a2c2b" media="(prefers-color-scheme: dark)">
+  <script>try{var t=JSON.parse(localStorage.getItem("dubdeck:theme"));if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 22'%3E%3Crect width='32' height='22' rx='3' fill='%23383c3a'/%3E%3Crect x='3' y='3' width='26' height='12' rx='1.5' fill='%23f2efe6'/%3E%3Crect x='8' y='7' width='16' height='5' rx='2.5' fill='%232a2623'/%3E%3Ccircle cx='11' cy='9.5' r='1.6' fill='%23e2962b'/%3E%3Ccircle cx='21' cy='9.5' r='1.6' fill='%23e2962b'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -21,7 +31,15 @@
           <svg viewBox="0 0 32 22" aria-hidden="true"><rect width="32" height="22" rx="3" fill="currentColor"/><rect x="3" y="3" width="26" height="12" rx="1.5" fill="var(--label)"/><rect x="8" y="7" width="16" height="5" rx="2.5" fill="var(--window)"/><circle cx="11" cy="9.5" r="1.6" fill="var(--amber)"/><circle cx="21" cy="9.5" r="1.6" fill="var(--amber)"/></svg>
           Dubdeck
         </a>
-        <p class="model">Copies Spotify playlists to YouTube Music</p>
+        <div class="deck-top-right">
+          <p class="model">Copies Spotify playlists to YouTube Music</p>
+          <fieldset class="selector" id="theme-switch">
+            <legend class="sr-only">Colours</legend>
+            <label><input type="radio" name="theme" value="auto" class="sr-only" checked><span>Auto</span></label>
+            <label><input type="radio" name="theme" value="light" class="sr-only"><span>Light</span></label>
+            <label><input type="radio" name="theme" value="dark" class="sr-only"><span>Dark</span></label>
+          </fieldset>
+        </div>
       </div>
 
       <div class="deck-bays">
@@ -72,14 +90,21 @@
   <main class="wrap">
     <div class="flash" id="flash" role="alert" hidden>
       <span class="led rec" aria-hidden="true"></span>
-      <p id="flash-text"></p>
+      <div class="flash-body">
+        <p id="flash-text"></p>
+        <div class="flash-actions" id="flash-actions"></div>
+      </div>
       <button type="button" class="textbtn" id="flash-close">Dismiss</button>
     </div>
 
-    <!-- ========================================================== google setup (shown when no client ID is configured) -->
+    <!-- ========================================================== google setup: no client ID configured, or the user wants their own -->
     <section class="panel" id="google-setup" hidden>
-      <h3>Set up Google sign-in</h3>
-      <p class="lede">This copy of Dubdeck doesn't have a Google sign-in ID yet. Making one is free and takes about ten minutes.</p>
+      <div class="panel-head">
+        <h3 id="g-title">Set up Google sign-in</h3>
+        <button type="button" class="textbtn" id="g-close">Close</button>
+      </div>
+      <p class="lede" id="g-lede">This copy of Dubdeck doesn't have a Google sign-in ID yet. Making one is free and takes about ten minutes.</p>
+      <p class="g-current" id="g-current" hidden></p>
       <ol class="howto">
         <li><span>Open the <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener">Google Cloud console</a> and create a project (any name).</span></li>
         <li><span>Turn on the <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">YouTube Data API v3</a> for that project.</span></li>
@@ -116,6 +141,7 @@
           <li><b>One playlist:</b> open it in Spotify, then <b>•••</b> › <b>Share</b> › <b>Copy link to playlist</b>. The whole playlist comes over.</li>
           <li><b>All your playlists:</b> open your Spotify profile, then <b>•••</b> › <b>Copy link to profile</b>. Dubdeck lists every playlist shown on your profile so you can tick the ones to copy.</li>
         </ul>
+        <p class="try-line">No link handy? <button type="button" class="textbtn" id="try-example">Try it with Today's Top Hits</button> to see how matching works. Nothing is sent to YouTube unless you choose to.</p>
       </article>
 
       <details class="more-ways" id="more-ways">
@@ -170,7 +196,10 @@
         <p class="lede" id="work-lede"></p>
       </div>
       <div class="panel work">
-        <p class="work-label" id="work-label" aria-live="polite">Starting…</p>
+        <div class="work-line">
+          <p class="work-label" id="work-label" aria-live="polite">Starting…</p>
+          <p class="work-eta" id="work-eta"></p>
+        </div>
         <div class="tapebar" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="work-bar"><i></i></div>
         <div class="work-actions"><button type="button" class="key" id="work-stop">Stop</button></div>
       </div>
@@ -181,7 +210,7 @@
       <div class="view-head-row">
         <div class="view-head">
           <h2>Check matches</h2>
-          <p class="lede">Songs with a full meter are almost certainly right. Look over the ones marked to check, and use Change to pick a different version or paste a link.</p>
+          <p class="lede">Songs with a full meter are almost certainly right. Press a song's number or cover to hear it, and use Change to pick another version, search, or paste a link.</p>
         </div>
         <div class="filters" id="filters" role="group" aria-label="Show songs">
           <button type="button" data-filter="all" aria-pressed="true">All <span class="n" id="n-all">0</span></button>
@@ -190,7 +219,26 @@
           <button type="button" data-filter="skipped" aria-pressed="false">Left out <span class="n" id="n-skipped">0</span></button>
         </div>
       </div>
-      <div id="review-list" style="display:grid;gap:1.25rem"></div>
+
+      <div class="checkstrip" id="checkstrip" hidden>
+        <span class="led amber" aria-hidden="true"></span>
+        <p id="checkstrip-text"></p>
+        <div class="checkstrip-keys">
+          <button type="button" class="key key-primary" id="check-start">Check them one by one</button>
+          <button type="button" class="key key-small" id="keep-all">Keep all</button>
+          <button type="button" class="key key-small" id="drop-all">Leave all out</button>
+        </div>
+      </div>
+
+      <div class="review-tools">
+        <div class="songfind">
+          <label class="sr-only" for="song-filter">Find a song</label>
+          <input type="search" id="song-filter" placeholder="Find a song or artist" autocomplete="off">
+        </div>
+        <button type="button" class="textbtn" id="download-csv">Download the list (CSV)</button>
+      </div>
+
+      <div id="review-list" class="review-list"></div>
       <div><button type="button" class="textbtn" id="back-to-add">Back to playlists</button></div>
     </section>
 
@@ -201,18 +249,57 @@
         <p class="lede" id="done-lede"></p>
       </div>
       <div class="panel paused" id="paused" hidden>
-        <p id="paused-text"></p>
-        <div><button type="button" class="key key-primary" id="resume"><span class="rec-dot" aria-hidden="true"></span>Continue transfer</button></div>
+        <div class="paused-row">
+          <div class="countdown" id="countdown" hidden aria-hidden="true"><span id="countdown-h">00</span><i>:</i><span id="countdown-m">00</span></div>
+          <p id="paused-text"></p>
+        </div>
+        <div class="paused-keys">
+          <button type="button" class="key key-primary" id="resume"><span class="rec-dot" aria-hidden="true"></span>Continue transfer</button>
+          <button type="button" class="key" id="remind" hidden>Add a reminder to my calendar</button>
+          <button type="button" class="textbtn" id="own-project-quota" hidden>Get my own daily limit</button>
+        </div>
       </div>
       <div class="results" id="results"></div>
-      <div><button type="button" class="key" id="start-over">Transfer more playlists</button></div>
+      <div class="done-keys">
+        <button type="button" class="key" id="start-over">Transfer more playlists</button>
+        <button type="button" class="textbtn" id="download-csv-done">Download the list (CSV)</button>
+      </div>
     </section>
 
     <footer class="site-foot">
       <a href="/privacy.html">Privacy and terms</a>
       <a href="https://github.com/AalishMS/dubdeck" target="_blank" rel="noopener">Source on GitHub</a>
+      <button type="button" class="textbtn" id="own-project">Use my own Google project</button>
     </footer>
   </main>
+
+  <!-- ========================================================== monitor: plays a song from either side -->
+  <aside class="monitor" id="monitor" aria-label="Player" hidden></aside>
+
+  <div class="toast" id="toast" role="status" hidden>
+    <p id="toast-text"></p>
+    <button type="button" class="textbtn" id="toast-act" hidden></button>
+  </div>
+
+  <!-- ========================================================== check one by one -->
+  <dialog class="check" id="check" aria-labelledby="check-title">
+    <div class="check-head">
+      <h2 id="check-title">Check matches</h2>
+      <p class="check-count" id="check-count"></p>
+      <button type="button" class="textbtn" id="check-close">Close</button>
+    </div>
+    <div class="tapebar" aria-hidden="true" id="check-bar"><i></i></div>
+    <div class="check-body" id="check-body"></div>
+    <div class="check-player" id="check-player"></div>
+    <div class="check-foot" id="check-foot">
+      <div class="check-nav">
+        <button type="button" class="key key-small" id="check-prev">Back</button>
+        <button type="button" class="key key-small" id="check-skip">Skip</button>
+      </div>
+      <button type="button" class="key key-primary" id="check-keep">Keep this match</button>
+    </div>
+    <p class="keys-hint" id="check-keys"><kbd>Enter</kbd> keep <kbd>1</kbd>–<kbd>9</kbd> pick <kbd>X</kbd> leave out <kbd>A</kbd> <kbd>B</kbd> listen <kbd>/</kbd> search <kbd>←</kbd> <kbd>→</kbd> move</p>
+  </dialog>
 
   <div class="actionbar" id="actionbar" hidden>
     <div class="wrap actionbar-inner">
