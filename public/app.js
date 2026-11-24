@@ -1,8 +1,11 @@
 // Dubdeck front end. Plain JS, no build step.
 //
-// Spotify is read straight from the browser (PKCE login, no server involved).
-// YouTube Music calls go through the stateless /api/ytm/* endpoints, carrying the
-// user's headers from this browser. All state lives in localStorage.
+// 1. Add playlists: paste Spotify song/playlist links (read via /api/spotify/*, no login)
+//    or upload an Exportify / TuneMyMusic CSV or Spotify data-download JSON.
+// 2. Check matches: /api/ytm/match searches YouTube Music anonymously.
+// 3. Transfer: the browser signs in with Google and writes playlists through the official
+//    YouTube Data API. Progress is saved so a transfer can continue after Google's daily limit.
+// Everything the user adds lives in this browser's localStorage.
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -36,7 +39,7 @@ const store = {
 };
 
 class HttpError extends Error {
-  constructor(message, status) { super(message); this.status = status; }
+  constructor(message, status, reason = "") { super(message); this.status = status; this.reason = reason; }
 }
 
 async function api(path, { method = "GET", body } = {}) {
@@ -67,265 +70,408 @@ const fmtTime = (s) => {
 };
 const plural = (n, one, many = one + "s") => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s);
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+const region = (() => {
+  for (const l of navigator.languages || [navigator.language || ""]) {
+    const m = /^[a-z]{2,3}-([A-Z]{2})$/i.exec(l);
+    if (m) return m[1].toUpperCase();
+  }
+  return null;
+})();
 
 // ------------------------------------------------------------------ state
 
 const state = {
-  config: { spotify_client_id: null },
-  playlists: [],
+  config: { google_client_id: null },
+  library: store.get("library", []), // [{ uid, name, image, owner, liked, source, note, description, tracks }]
   selected: new Set(store.get("selected", [])),
-  review: store.get("review"), // { playlists: [...], errors }
+  review: store.get("review"),
+  transfer: store.get("transfer"),
   filter: "all",
-  openAlt: null, // "pi:ti"
-  shown: {}, // pi -> rows shown
-  run: null, // { kind, cancelled } while matching / transferring
+  openAlt: null,
+  shown: {},
+  run: null, // { kind, cancelled } while importing / matching / transferring
+  view: null,
 };
-const matchCache = new Map(); // spotify track key -> match result, for this tab
+const matchCache = new Map();
 
-// ------------------------------------------------------------------ Spotify (browser-side)
-
-const SPOTIFY_API = "https://api.spotify.com/v1";
-const SPOTIFY_SCOPES = "playlist-read-private playlist-read-collaborative user-library-read";
-const LIKED_ID = "liked";
-
-function redirectUri() {
-  const origin = location.hostname === "localhost" ? location.origin.replace("//localhost", "//127.0.0.1") : location.origin;
-  return `${origin}/callback.html`;
+function saveLibrary() {
+  const ok = store.set("library", state.library);
+  store.set("selected", [...state.selected]);
+  if (!ok) flash("Your playlists are too big to save in this browser. They'll work now, but will be gone if you reload.");
 }
 
-const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-const randomString = (n) => b64url(crypto.getRandomValues(new Uint8Array(n)));
+// ------------------------------------------------------------------ importing: paste
 
-const spotify = {
-  clientId() { return store.get("spotify.clientId") || state.config.spotify_client_id || null; },
-  token() { return store.get("spotify.token"); },
-  user() { return store.get("spotify.user"); },
-  connected() { const t = this.token(); return !!t && t.client_id === this.clientId(); },
+const LINK_RE = /(?:open\.spotify\.com\/(?:intl-[a-z-]+\/)?(track|playlist|album)\/|spotify:(track|playlist|album):)([A-Za-z0-9]{22})/g;
 
-  logout() { store.del("spotify.token"); store.del("spotify.user"); },
+function parsePaste(text) {
+  const trackIds = [];
+  const collections = [];
+  for (const m of text.matchAll(LINK_RE)) {
+    const kind = m[1] || m[2];
+    if (kind === "track") trackIds.push(m[3]);
+    else if (!collections.some((c) => c.id === m[3])) collections.push({ kind, id: m[3] });
+  }
+  const localFiles = (text.match(/spotify:local:|open\.spotify\.com\/local\//g) || []).length;
+  return { trackIds, collections, localFiles };
+}
 
-  async login() {
-    if (location.hostname === "localhost") {
-      // Spotify only accepts 127.0.0.1 for local redirect URIs; keep storage on one origin.
-      location.href = location.href.replace("//localhost", "//127.0.0.1");
-      return;
+function libEntry(fields) {
+  return { uid: uid(), name: "Untitled", image: null, owner: "", liked: false, source: "paste", note: null, description: "", tracks: [], ...fields };
+}
+
+function addToLibrary(entries) {
+  const nonEmpty = entries.filter((e) => e.tracks.length);
+  state.library.push(...nonEmpty);
+  nonEmpty.forEach((e) => state.selected.add(e.uid));
+  saveLibrary();
+  return nonEmpty.length;
+}
+
+$("#form-paste").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearFlash();
+  const { trackIds, collections, localFiles } = parsePaste($("#paste-box").value);
+  if (!trackIds.length && !collections.length) {
+    flash("No Spotify links found. In the Spotify desktop app, select songs with Ctrl+A, copy them with Ctrl+C, and paste them here.");
+    return;
+  }
+  const name = $("#paste-name").value.trim();
+  beginRun("import");
+  setWork("Reading songs from Spotify", "Song details come from Spotify's public pages, so no login is needed.");
+  setLabels("Spotify", "Reading…");
+  show("working");
+
+  const added = [];
+  const problems = [];
+  for (const [i, c] of collections.entries()) {
+    if (state.run.cancelled) break;
+    tick({ label: `Reading ${c.kind} ${i + 1} of ${collections.length}…`, done: 0, total: 0, verb: "Reading…" });
+    try {
+      const col = await api("/api/spotify/collection", { method: "POST", body: c });
+      added.push(libEntry({
+        name: col.name, image: col.image, owner: col.owner, source: c.kind, tracks: col.tracks,
+        note: col.maybe_truncated ? "Only the first 100 songs. Paste the rest from the app." : null,
+      }));
+    } catch (err) {
+      problems.push(err.message);
     }
-    const verifier = randomString(64);
-    const st = randomString(16);
-    sessionStorage.setItem("dubdeck:pkce", JSON.stringify({ verifier, state: st }));
-    const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
-    location.href = "https://accounts.spotify.com/authorize?" + new URLSearchParams({
-      client_id: this.clientId(),
-      response_type: "code",
-      redirect_uri: redirectUri(),
-      code_challenge_method: "S256",
-      code_challenge: challenge,
-      scope: SPOTIFY_SCOPES,
-      state: st,
+  }
+
+  if (trackIds.length && !state.run.cancelled) {
+    const unique = [...new Set(trackIds)];
+    const found = new Map();
+    const queue = [];
+    for (let i = 0; i < unique.length; i += 40) queue.push(unique.slice(i, i + 40));
+    let done = 0;
+    const worker = async () => {
+      while (queue.length && !state.run.cancelled) {
+        const ids = queue.shift();
+        try {
+          const { tracks } = await api("/api/spotify/tracks", { method: "POST", body: { ids } });
+          ids.forEach((id, k) => tracks[k] && found.set(id, tracks[k]));
+        } catch (err) {
+          problems.push(err.message);
+        }
+        done += ids.length;
+        tick({ label: "Reading song details from Spotify…", done, total: unique.length });
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    const tracks = trackIds.map((id) => found.get(id)).filter(Boolean);
+    const missing = trackIds.length - tracks.length;
+    added.push(libEntry({
+      name: name || `Pasted songs ${new Date().toLocaleDateString()}`,
+      source: "paste",
+      tracks,
+      note: missing ? `${plural(missing, "song")} couldn't be read` : null,
+    }));
+  }
+
+  const cancelled = state.run.cancelled;
+  state.run = null;
+  setTape(0, false);
+  resetDeck();
+  const n = addToLibrary(added);
+  if (n) {
+    $("#paste-box").value = "";
+    $("#paste-name").value = "";
+  }
+  const notes = [...new Set(problems)];
+  if (localFiles) notes.push(`${plural(localFiles, "local file")} skipped: local files aren't on Spotify, so they can't be matched.`);
+  if (cancelled) notes.unshift("Stopped. Anything read before you stopped was added.");
+  goAdd();
+  if (notes.length) flash(notes.join(" "));
+});
+
+// ------------------------------------------------------------------ importing: files
+
+function parseCSV(text) {
+  text = text.replace(/^﻿/, "");
+  const rows = [];
+  let row = [], field = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; } else q = false;
+      } else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c !== "\r") field += c;
+  }
+  if (field !== "" || row.length) { row.push(field); rows.push(row); }
+  return rows.filter((r) => r.some((x) => x.trim() !== ""));
+}
+
+const idFrom = (s) => (/(?:track[/:])([A-Za-z0-9]{22})/.exec(s || "") || [])[1] || null;
+const baseName = (fileName) => fileName.replace(/\.[^.]+$/, "").replace(/[_]+/g, " ").trim();
+const isLikedName = (n) => /^liked[ _-]?songs$/i.test(n.trim());
+
+function parseDuration(v, header) {
+  v = (v || "").trim();
+  if (!v) return null;
+  if (/^\d+:\d{2}(:\d{2})?$/.test(v)) return v.split(":").reduce((a, x) => a * 60 + Number(x), 0);
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return /\(ms\)|ms\b/i.test(header) || n > 10000 ? n / 1000 : n;
+}
+
+function fromCSV(text, fileName) {
+  const rows = parseCSV(text);
+  if (rows.length < 2) throw new Error(`${fileName}: no songs found.`);
+  const header = rows[0].map((x) => x.trim());
+  const col = (...patterns) => {
+    for (const re of patterns) {
+      const i = header.findIndex((x) => re.test(x));
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+  const iTitle = col(/^track name$/i, /^(song|song name|title|track|track title|name)$/i, /track.?name/i, /title/i);
+  const iArtist = col(/^artist name\(s\)$/i, /^artist name$/i, /^artists?$/i, /^(?!album).*artist/i);
+  const iAlbum = col(/^album name$/i, /^album$/i, /^album.?(name|title)$/i);
+  const iDur = col(/duration/i, /^length$/i, /^time$/i);
+  const iIsrc = col(/isrc/i);
+  const iUri = col(/^track uri$/i, /^spotify.*(id|uri|url)$/i, /^(uri|url)$/i);
+  const iPl = col(/^playlist( name)?$/i, /^playlist/i);
+  if (iTitle < 0 || iArtist < 0) throw new Error(`${fileName}: couldn't find the song title and artist columns.`);
+
+  const groups = new Map();
+  for (const r of rows.slice(1)) {
+    const title = (r[iTitle] || "").trim();
+    if (!title) continue;
+    const artists = (r[iArtist] || "").split(/(?<!\\),|;/).map((a) => a.replace(/\\,/g, ",").trim()).filter(Boolean);
+    const group = iPl >= 0 && r[iPl]?.trim() ? r[iPl].trim() : baseName(fileName);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push({
+      id: iUri >= 0 ? idFrom(r[iUri]) : null,
+      title,
+      artists,
+      album: iAlbum >= 0 ? (r[iAlbum] || "").trim() : "",
+      duration_sec: iDur >= 0 ? parseDuration(r[iDur], header[iDur]) : null,
+      isrc: iIsrc >= 0 ? (r[iIsrc] || "").trim().toUpperCase() || null : null,
     });
-  },
+  }
+  return [...groups].map(([name, tracks]) =>
+    libEntry({ name: isLikedName(name) ? "Liked Songs" : name, liked: isLikedName(name), source: "file", tracks })
+  );
+}
 
-  /** Finish the login if Spotify just sent us back. Returns true if this was a callback. */
-  async handleCallback() {
-    const p = new URLSearchParams(location.search);
-    if (!p.has("state")) return false;
-    history.replaceState(null, "", "/");
-    let saved = null;
-    try { saved = JSON.parse(sessionStorage.getItem("dubdeck:pkce") || "null"); } catch {}
-    sessionStorage.removeItem("dubdeck:pkce");
-    if (p.get("error")) {
-      flash(p.get("error") === "access_denied" ? "Spotify login was cancelled." : `Spotify login failed: ${p.get("error")}`);
-      return true;
+function fromSpotifyExport(obj, fileName) {
+  if (Array.isArray(obj?.playlists)) {
+    return obj.playlists.map((p) => libEntry({
+      name: p.name || "Untitled",
+      description: p.description || "",
+      source: "export",
+      tracks: (p.items || []).map((it) => it.track).filter((t) => t?.trackName).map((t) => ({
+        id: idFrom(t.trackUri), title: t.trackName, artists: [t.artistName].filter(Boolean), album: t.albumName || "", duration_sec: null, isrc: null,
+      })),
+    }));
+  }
+  if (Array.isArray(obj?.tracks)) {
+    return [libEntry({
+      name: "Liked Songs", liked: true, source: "export",
+      tracks: obj.tracks.filter((t) => t?.track).map((t) => ({
+        id: idFrom(t.uri), title: t.track, artists: [t.artist].filter(Boolean), album: t.album || "", duration_sec: null, isrc: null,
+      })),
+    })];
+  }
+  throw new Error(`${fileName}: this isn't a Spotify playlist (Playlist1.json) or library (YourLibrary.json) file.`);
+}
+
+async function importFiles(files) {
+  clearFlash();
+  const added = [];
+  const problems = [];
+  for (const f of files) {
+    try {
+      if (/\.zip$/i.test(f.name)) throw new Error(`${f.name}: unzip it first, then upload the files inside.`);
+      if (f.size > 40 * 1024 * 1024) throw new Error(`${f.name}: file is too big.`);
+      const text = await f.text();
+      if (/\.json$/i.test(f.name) || /^\s*[{[]/.test(text)) added.push(...fromSpotifyExport(JSON.parse(text), f.name));
+      else added.push(...fromCSV(text, f.name));
+    } catch (err) {
+      problems.push(err instanceof SyntaxError ? `${f.name}: not valid JSON.` : err.message);
     }
-    if (!saved || saved.state !== p.get("state") || !p.get("code")) {
-      flash("That Spotify login expired. Choose Connect Spotify again.");
-      return true;
+  }
+  const n = addToLibrary(added);
+  renderShelf();
+  renderDecks();
+  if (problems.length) flash(problems.join(" "));
+  else if (!n) flash("Those files didn't contain any songs.");
+}
+
+$("#file-input").addEventListener("change", (e) => {
+  importFiles([...e.target.files]);
+  e.target.value = "";
+});
+const dz = $("#dropzone");
+["dragenter", "dragover"].forEach((t) => dz.addEventListener(t, (e) => { e.preventDefault(); dz.classList.add("over"); }));
+["dragleave", "drop"].forEach((t) => dz.addEventListener(t, () => dz.classList.remove("over")));
+dz.addEventListener("drop", (e) => { e.preventDefault(); importFiles([...e.dataTransfer.files]); });
+
+// ------------------------------------------------------------------ Google sign-in + YouTube Data API
+
+const GOOGLE_SCOPE = "https://www.googleapis.com/auth/youtube";
+const YT_API = "https://www.googleapis.com/youtube/v3";
+
+const gauth = {
+  clientId() { return store.get("google.clientId") || state.config.google_client_id || null; },
+  token() {
+    const t = store.get("google.token");
+    return t && t.expires_at - Date.now() > 60_000 ? t.access_token : null;
+  },
+  account() { return store.get("google.account"); },
+  signedIn() { return !!this.token(); },
+
+  async signIn() {
+    if (!this.clientId()) {
+      showGoogleSetup();
+      return false;
     }
-    const res = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code: p.get("code"),
-        redirect_uri: redirectUri(),
+    for (let i = 0; i < 50 && !window.google?.accounts?.oauth2; i++) await sleep(100);
+    if (!window.google?.accounts?.oauth2) {
+      flash("Google sign-in didn't load. Check your connection or ad blocker, then reload the page.");
+      return false;
+    }
+    const resp = await new Promise((resolve) => {
+      const client = window.google.accounts.oauth2.initTokenClient({
         client_id: this.clientId(),
-        code_verifier: saved.verifier,
-      }),
-    }).catch(() => null);
-    const data = res ? await res.json().catch(() => ({})) : {};
-    if (!res || !res.ok) {
-      flash(`Spotify login failed: ${data.error_description || data.error || "network error"}`);
-      return true;
+        scope: GOOGLE_SCOPE,
+        callback: resolve,
+        error_callback: (err) => resolve({ error: err?.type || "failed", error_description: err?.message }),
+      });
+      client.requestAccessToken();
+    });
+    if (resp.error || !resp.access_token) {
+      const msg = {
+        popup_closed: "Google sign-in was closed before it finished.",
+        popup_failed_to_open: "Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again.",
+        access_denied: "Google sign-in was cancelled.",
+      }[resp.error] || `Google sign-in failed: ${resp.error_description || resp.error}`;
+      flash(msg);
+      return false;
     }
-    this._save(data);
+    if (!window.google.accounts.oauth2.hasGrantedAllScopes(resp, GOOGLE_SCOPE)) {
+      flash("Dubdeck needs permission to manage your YouTube playlists. Sign in again and tick the YouTube box.");
+      return false;
+    }
+    store.set("google.token", { access_token: resp.access_token, expires_at: Date.now() + (Number(resp.expires_in) || 3600) * 1000 });
+    try {
+      const data = await ytApi("GET", "/channels", { params: { part: "snippet", mine: "true" } });
+      const ch = data.items?.[0];
+      store.set("google.account", { name: ch?.snippet?.title || "Google account", hasChannel: !!ch });
+    } catch {
+      store.set("google.account", { name: "Google account", hasChannel: null });
+    }
+    renderDecks();
+    renderActionBar();
     return true;
   },
 
-  _save(tok) {
-    const old = this.token() || {};
-    store.set("spotify.token", {
-      access_token: tok.access_token,
-      refresh_token: tok.refresh_token || old.refresh_token,
-      expires_at: Date.now() + (Number(tok.expires_in) || 3600) * 1000,
-      client_id: this.clientId(),
+  signOut() {
+    const t = store.get("google.token");
+    if (t?.access_token && window.google?.accounts?.oauth2) window.google.accounts.oauth2.revoke(t.access_token, () => {});
+    store.del("google.token");
+    store.del("google.account");
+    renderDecks();
+    renderActionBar();
+  },
+};
+
+async function ytApi(method, path, { params, body } = {}) {
+  const token = gauth.token();
+  if (!token) throw new HttpError("Your Google sign-in expired.", 401, "authError");
+  const url = `${YT_API}${path}${params ? "?" + new URLSearchParams(params) : ""}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new HttpError("Lost the connection to YouTube.", 0, "network");
+  }
+  if (res.status === 204) return {};
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const reason = data?.error?.errors?.[0]?.reason || data?.error?.details?.[0]?.reason || "";
+    throw new HttpError(data?.error?.message || `YouTube returned ${res.status}`, res.status, reason);
+  }
+  return data;
+}
+
+const TRANSIENT = new Set(["network", "backendError", "rateLimitExceeded", "userRateLimitExceeded", "internalError"]);
+
+async function withRetry(fn, { retryPlaylistNotFound = false } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const transient = TRANSIENT.has(e.reason) || e.status === 0 || e.status >= 500 || (retryPlaylistNotFound && e.reason === "playlistNotFound");
+      if (!transient || attempt >= 3) throw e;
+      await sleep(1500 * 2 ** attempt);
+    }
+  }
+}
+
+const yt = {
+  async createPlaylist(title, description, privacy) {
+    const data = await ytApi("POST", "/playlists", {
+      params: { part: "snippet,status" },
+      body: {
+        snippet: { title: title.replace(/[<>]/g, "").slice(0, 150) || "Imported from Spotify", description: description.replace(/[<>]/g, "").slice(0, 4900) },
+        status: { privacyStatus: privacy.toLowerCase() },
+      },
+    });
+    return data.id;
+  },
+  addItem(playlistId, videoId) {
+    return ytApi("POST", "/playlistItems", {
+      params: { part: "snippet" },
+      body: { snippet: { playlistId, resourceId: { kind: "youtube#video", videoId } } },
     });
   },
-
-  _refreshing: null,
-  async refresh() {
-    if (this._refreshing) return this._refreshing;
-    this._refreshing = (async () => {
-      const t = this.token();
-      if (!t?.refresh_token) throw this._expired();
-      const res = await fetch("https://accounts.spotify.com/api/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: t.refresh_token, client_id: this.clientId() }),
-      }).catch(() => null);
-      if (!res || !res.ok) throw this._expired();
-      this._save(await res.json());
-    })().finally(() => (this._refreshing = null));
-    return this._refreshing;
-  },
-
-  _expired() {
-    this.logout();
-    return new HttpError("Your Spotify session expired. Connect Spotify again.", 401);
-  },
-
-  async accessToken() {
-    const t = this.token();
-    if (!t) throw new HttpError("Spotify is not connected.", 401);
-    if (t.expires_at - Date.now() < 60_000) await this.refresh();
-    return this.token().access_token;
-  },
-
-  async get(path, params) {
-    let url = path.startsWith("http") ? path : SPOTIFY_API + path;
-    if (params) url += "?" + new URLSearchParams(params);
-    let refreshed = false;
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${await this.accessToken()}` } }).catch(() => null);
-      if (!res) { await sleep(1500 * (attempt + 1)); continue; }
-      if (res.ok) return res.json();
-      if (res.status === 401 && !refreshed) { await this.refresh(); refreshed = true; continue; }
-      if (res.status === 429) { await sleep(Math.min(Number(res.headers.get("Retry-After")) || 5, 60) * 1000); continue; }
-      if (res.status >= 500) { await sleep(1500 * (attempt + 1)); continue; }
-      const body = await res.json().catch(() => ({}));
-      if (res.status === 401) throw this._expired();
-      throw new HttpError(`Spotify said: ${body?.error?.message || res.statusText} (${res.status})`, res.status);
-    }
-    throw new HttpError("Spotify kept failing (rate limited or unavailable). Try again in a minute.", 503);
-  },
-
-  async paginate(path, params, onPage) {
-    const out = [];
-    let page = await this.get(path, params);
-    for (;;) {
-      out.push(...(page.items || []));
-      onPage?.(out.length, page.total || out.length);
-      if (!page.next) return out;
-      page = await this.get(page.next);
-    }
-  },
-
-  async me() {
-    const d = await this.get("/me");
-    const user = { id: d.id, name: d.display_name || d.id };
-    store.set("spotify.user", user);
-    return user;
-  },
-
-  async playlists() {
-    const me = this.user() || (await this.me());
-    const liked = await this.get("/me/tracks", { limit: 1 });
-    const out = [{ id: LIKED_ID, name: "Liked Songs", description: "", image: null, owner: me.name, total: liked.total || 0, readable: true, liked: true }];
-    for (const p of await this.paginate("/me/playlists", { limit: 50 })) {
-      if (!p) continue;
-      const owner = p.owner || {};
-      // the playlist's track summary was renamed from "tracks" to "items" in Feb 2026
-      const summary = (p.items && !Array.isArray(p.items) ? p.items : p.tracks) || {};
-      out.push({
-        id: p.id,
-        name: p.name || "Untitled",
-        description: decodeEntities(p.description || ""),
-        image: p.images?.[0]?.url || null,
-        owner: owner.display_name || owner.id || "",
-        total: summary.total || 0,
-        readable: owner.id === me.id || !!p.collaborative,
-        liked: false,
-      });
-    }
-    return out;
-  },
-
-  async tracks(id, onProgress) {
-    let entries;
-    try {
-      entries = id === LIKED_ID
-        ? await this.paginate("/me/tracks", { limit: 50 }, onProgress)
-        : await this.paginate(`/playlists/${id}/items`, { limit: 50, additional_types: "track" }, onProgress);
-    } catch (e) {
-      if (e.status === 403 && id !== LIKED_ID) {
-        throw new HttpError("Spotify only lets apps read playlists you own or collaborate on. Copy it into one of your own playlists first.", 403);
-      }
-      throw e;
-    }
-    return entries.map(toTrack).filter(Boolean);
+  like(videoId) {
+    return ytApi("POST", "/videos/rate", { params: { id: videoId, rating: "like" } });
   },
 };
 
-function toTrack(entry) {
-  const t = entry?.item || entry?.track;
-  if (!t || (t.type && t.type !== "track") || !t.name) return null; // episodes, removed tracks
-  return {
-    id: t.id || null,
-    title: t.name,
-    artists: (t.artists || []).map((a) => a.name).filter(Boolean),
-    album: t.album?.name || "",
-    duration_sec: t.duration_ms ? t.duration_ms / 1000 : null,
-    isrc: t.external_ids?.isrc || null,
-  };
+function friendlyYtError(e) {
+  const r = e.reason || "";
+  if (r === "youtubeSignupRequired" || r === "channelNotFound" || r === "channelClosed")
+    return "Your Google account needs a YouTube channel before it can have playlists. Create one at youtube.com/create_channel, then press Continue transfer.";
+  if (r === "accessNotConfigured" || r === "SERVICE_DISABLED")
+    return "The YouTube Data API isn't turned on for this Google project. Turn it on in the Google Cloud console, then press Continue transfer.";
+  if (r === "insufficientPermissions" || r === "ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+    return "Dubdeck doesn't have permission to manage your YouTube playlists. Sign out, sign in again and allow YouTube access.";
+  if (r === "playlistContainsMaximumNumOfVideos") return "This playlist is full: YouTube allows up to 5,000 songs per playlist.";
+  return e.message;
 }
-
-function decodeEntities(s) {
-  const ta = document.createElement("textarea");
-  ta.innerHTML = s;
-  return ta.value;
-}
-
-// ------------------------------------------------------------------ YouTube Music (via stateless API)
-
-const ytm = {
-  auth() { return store.get("ytm.auth"); },
-  account() { return store.get("ytm.account"); },
-  connected() { return !!this.auth(); },
-  async connect(raw) {
-    const { auth, account } = await api("/api/ytm/connect", { method: "POST", body: { headers: raw } });
-    store.set("ytm.auth", auth);
-    store.set("ytm.account", account);
-  },
-  disconnect() { store.del("ytm.auth"); store.del("ytm.account"); },
-  async call(path, body, { retries = 2 } = {}) {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await api(path, { method: "POST", body: { auth: this.auth(), ...body } });
-      } catch (e) {
-        if (e.status === 401) {
-          this.disconnect();
-          renderDecks();
-          renderSetup();
-          throw e;
-        }
-        const transient = e.status === 0 || e.status >= 500;
-        if (!transient || attempt >= retries) throw e;
-        await sleep(1500 * (attempt + 1));
-      }
-    }
-  },
-};
-
-const bothConnected = () => spotify.connected() && ytm.connected();
 
 // ------------------------------------------------------------------ cassette deck
 
@@ -366,8 +512,7 @@ function cassetteMarkup(k) {
 
 function mountCassettes() {
   for (const k of ["a", "b"]) $(`[data-cassette="${k}"]`).innerHTML = cassetteMarkup(k);
-  setLabels("Spotify", "YouTube Music");
-  setTape(0, false);
+  resetDeck();
 }
 
 function setLabels(a, b) {
@@ -393,9 +538,7 @@ function setCounter(n) {
   $("#counter").setAttribute("aria-label", `${n || 0} songs processed`);
 }
 
-function setTransport(text) {
-  $("#transport-status").textContent = text;
-}
+const setTransport = (text) => ($("#transport-status").textContent = text);
 
 function resetDeck() {
   setCounter(0);
@@ -404,14 +547,26 @@ function resetDeck() {
   setLabels("Spotify", "YouTube Music");
 }
 
+function renderDecks() {
+  const songs = state.library.reduce((a, p) => a + p.tracks.length, 0);
+  $("#bay-a").dataset.state = state.library.length ? "on" : "off";
+  $("#acct-a").textContent = state.library.length ? `${plural(state.library.length, "playlist")}, ${plural(songs, "song")}` : "Nothing added yet";
+  const on = gauth.signedIn();
+  $("#bay-b").dataset.state = on ? "on" : "off";
+  $("#acct-b").textContent = on ? gauth.account()?.name || "Signed in" : "Not signed in";
+  $("#yt-auth").textContent = on ? "Sign out" : "Sign in";
+}
+
+$("#yt-auth").addEventListener("click", () => (gauth.signedIn() ? gauth.signOut() : gauth.signIn()));
+
 // ------------------------------------------------------------------ views
 
-const STEP_OF = { connect: 0, choose: 1, working: 2, review: 2, transferring: 3, done: 3 };
+const STEP_OF = { add: 0, import: 0, working: 1, review: 1, transferring: 2, done: 2 };
 
 function show(view) {
-  const id = view === "transferring" ? "working" : view;
+  const id = { import: "working", transferring: "working" }[view] || view;
   $$(".view").forEach((v) => (v.hidden = v.id !== `view-${id}`));
-  const current = STEP_OF[view];
+  const current = STEP_OF[view === "working" && state.run?.kind === "import" ? "import" : view];
   $$("#steps li").forEach((li) => {
     const n = Number(li.dataset.step);
     li.classList.toggle("done", n < current);
@@ -430,111 +585,63 @@ function flash(msg) {
 function clearFlash() { $("#flash").hidden = true; }
 $("#flash-close").addEventListener("click", clearFlash);
 
+function showGoogleSetup() {
+  $("#g-origin").textContent = location.origin;
+  $("#google-setup").hidden = false;
+  $("#google-setup").scrollIntoView({ block: "start", behavior: "smooth" });
+}
+$("#copy-origin").addEventListener("click", (e) => copyText(location.origin, e.currentTarget));
+$("#form-google").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const id = $("#google-client-id").value.trim();
+  if (!/^[\w-]+\.apps\.googleusercontent\.com$/.test(id)) {
+    flash("That doesn't look like a Google client ID. It ends in .apps.googleusercontent.com.");
+    return;
+  }
+  store.set("google.clientId", id);
+  $("#google-setup").hidden = true;
+  clearFlash();
+  gauth.signIn();
+});
+
 function renderActionBar() {
   const bar = $("#actionbar"), btn = $("#action-btn"), sum = $("#action-summary");
   btn.replaceChildren();
-  if (state.view === "choose") {
-    const chosen = state.playlists.filter((p) => state.selected.has(p.id) && p.readable);
-    const tracks = chosen.reduce((a, p) => a + (p.total || 0), 0);
-    bar.hidden = false;
+  btn.disabled = false;
+  if (state.view === "add") {
+    const chosen = state.library.filter((p) => state.selected.has(p.uid));
+    const songs = chosen.reduce((a, p) => a + p.tracks.length, 0);
+    bar.hidden = !state.library.length;
     sum.replaceChildren(
-      chosen.length
-        ? h("span", {}, h("strong", { text: plural(chosen.length, "playlist") }), ` selected, ${plural(tracks, "song")}`)
-        : "Select the playlists you want to copy."
+      chosen.length ? h("span", {}, h("strong", { text: plural(chosen.length, "playlist") }), ` selected, ${plural(songs, "song")}`) : "Tick the playlists you want to copy."
     );
     btn.append("Find matches");
     btn.disabled = !chosen.length;
     btn.onclick = startMatch;
   } else if (state.view === "review" && state.review) {
     const pls = state.review.playlists.filter((pl) => pl.tracks.some((t) => t.sel && t.pick));
-    const n = state.review.playlists.reduce((a, pl) => a + pl.tracks.filter((t) => t.sel && t.pick).length, 0);
+    const n = state.review.playlists.reduce((a, pl) => a + new Set(pl.tracks.filter((t) => t.sel && t.pick).map((t) => t.pick.videoId)).size, 0);
     bar.hidden = false;
+    const days = Math.ceil((n + pls.length) / 195);
     sum.replaceChildren(
-      n ? h("span", {}, h("strong", { text: plural(n, "song") }), ` ready to go into ${plural(pls.length, "playlist")}`) : "No songs are selected."
+      n
+        ? h("span", {},
+            h("strong", { text: plural(n, "song") }), ` ready to go into ${plural(pls.length, "playlist")}.`,
+            days > 1 ? ` Google allows about 200 a day, so this takes about ${days} days. Progress is saved between days.` : "")
+        : "No songs are selected."
     );
-    btn.append(h("span", { class: "rec-dot", "aria-hidden": "true" }), "Transfer to YouTube Music");
+    if (gauth.signedIn()) {
+      btn.append(h("span", { class: "rec-dot", "aria-hidden": "true" }), "Transfer to YouTube Music");
+      btn.onclick = startTransfer;
+    } else {
+      btn.append("Sign in with Google to transfer");
+      btn.onclick = () => gauth.signIn();
+    }
     btn.disabled = !n;
-    btn.onclick = startTransfer;
   } else {
     bar.hidden = true;
   }
 }
-
-// ------------------------------------------------------------------ accounts & setup
-
-function renderDecks() {
-  const spOn = spotify.connected(), ytOn = ytm.connected();
-  $("#bay-a").dataset.state = spOn ? "on" : "off";
-  $("#acct-a").textContent = spOn ? spotify.user()?.name || "Connected" : spotify.clientId() ? "Ready to connect" : "Not set up";
-  $("#disc-a").hidden = !spOn;
-  $("#bay-b").dataset.state = ytOn ? "on" : "off";
-  $("#acct-b").textContent = ytOn ? ytm.account()?.name || "Connected" : "Not connected";
-  $("#disc-b").hidden = !ytOn;
-}
-
-function renderSetup() {
-  const spOn = spotify.connected(), cid = spotify.clientId();
-  $("#redirect-uri").textContent = redirectUri();
-  $("#redirect-uri-2").textContent = redirectUri();
-  $("#sp-connected").hidden = !spOn;
-  $("#sp-user").textContent = spotify.user()?.name || "";
-  const editing = $("#sp-setup").dataset.editing === "1";
-  $("#sp-setup").hidden = spOn || (!!cid && !editing);
-  $("#sp-ready").hidden = spOn || !cid || editing;
-  $("#sp-client-tail").textContent = (cid || "").slice(-4);
-  $("#yt-connected").hidden = !ytm.connected();
-  $("#yt-user").textContent = ytm.account()?.name || "";
-  $("#yt-setup").hidden = ytm.connected();
-}
-
-$("#copy-redirect").addEventListener("click", (e) => copyText(redirectUri(), e.currentTarget));
-
-$("#form-client-id").addEventListener("submit", (e) => {
-  e.preventDefault();
-  clearFlash();
-  const id = $("#client-id").value.trim();
-  if (!/^[A-Za-z0-9]{16,64}$/.test(id)) {
-    flash("That doesn't look like a Spotify Client ID. It's 32 letters and numbers, shown on your app's page.");
-    return;
-  }
-  store.set("spotify.clientId", id);
-  spotify.logout();
-  $("#sp-setup").dataset.editing = "0";
-  renderDecks();
-  renderSetup();
-});
-
-$("#sp-change").addEventListener("click", () => {
-  $("#sp-setup").dataset.editing = "1";
-  $("#client-id").value = spotify.clientId() || "";
-  renderSetup();
-  $("#client-id").focus();
-});
-
-$("#sp-login").addEventListener("click", () => spotify.login().catch((e) => flash(e.message)));
-
-$("#form-ytm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  clearFlash();
-  const btn = $("#ytm-submit");
-  btn.disabled = true;
-  btn.textContent = "Checking headers…";
-  try {
-    await ytm.connect($("#ytm-headers").value);
-    $("#ytm-headers").value = "";
-    renderDecks();
-    renderSetup();
-    route();
-  } catch (err) {
-    flash(err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Connect YouTube Music";
-  }
-});
-
-$("#disc-a").addEventListener("click", () => { spotify.logout(); renderDecks(); renderSetup(); route(); });
-$("#disc-b").addEventListener("click", () => { ytm.disconnect(); renderDecks(); renderSetup(); route(); });
 
 async function copyText(text, btn) {
   const old = btn.textContent;
@@ -552,14 +659,7 @@ async function copyText(text, btn) {
   setTimeout(() => (btn.textContent = old), 1600);
 }
 
-function handleAuthError(err) {
-  flash(err.message);
-  renderDecks();
-  renderSetup();
-  if (err.status === 401) show("connect");
-}
-
-// ------------------------------------------------------------------ choose playlists
+// ------------------------------------------------------------------ shelf
 
 const heart = () => {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -569,73 +669,84 @@ const heart = () => {
   return s;
 };
 
-async function loadPlaylists() {
-  const list = $("#pl-list");
-  list.replaceChildren(h("li", { class: "shelf-empty", text: "Loading your playlists from Spotify…" }));
-  try {
-    state.playlists = await spotify.playlists();
-    const ids = new Set(state.playlists.filter((p) => p.readable).map((p) => p.id));
-    state.selected = new Set([...state.selected].filter((id) => ids.has(id)));
-    renderPlaylists();
-  } catch (err) {
-    list.replaceChildren(h("li", { class: "shelf-empty", text: "Couldn't load playlists." }));
-    handleAuthError(err);
-  }
-}
-
-function renderPlaylists() {
-  const q = $("#pl-filter").value.trim().toLowerCase();
-  const items = state.playlists.filter((p) => !q || p.name.toLowerCase().includes(q));
-  const list = $("#pl-list");
-  if (!items.length) {
-    list.replaceChildren(h("li", { class: "shelf-empty", text: q ? "No playlists match that filter." : "No playlists found on this Spotify account." }));
-  } else {
-    list.replaceChildren(...items.map(playlistItem));
-  }
-  $("#pl-locked-note").hidden = !state.playlists.some((p) => !p.readable);
-  renderActionBar();
-}
-
 function coverFor(p) {
   if (p.liked) return h("span", { class: "tape-cover liked" }, heart());
   if (p.image) return h("img", { class: "tape-cover", src: p.image, alt: "", loading: "lazy" });
   return h("span", { class: "tape-cover" });
 }
 
-function playlistItem(p) {
-  const id = `pl-${p.id}`;
-  const meta = p.readable
-    ? `${plural(p.total, "song")}${p.liked ? "" : `, by ${p.owner}`}`
-    : `${plural(p.total, "song")}, by ${p.owner}. Can't be read.`;
-  const input = h("input", {
-    type: "checkbox", id, class: "sr-only", checked: state.selected.has(p.id), disabled: !p.readable,
-    onchange: (e) => {
-      e.target.checked ? state.selected.add(p.id) : state.selected.delete(p.id);
-      store.set("selected", [...state.selected]);
-      renderActionBar();
-    },
-  });
+const SOURCE_TEXT = { paste: "pasted", playlist: "from a playlist link", album: "album", file: "from a file", export: "from Spotify's data download" };
+
+function renderShelf() {
+  const has = state.library.length > 0;
+  $("#shelf-tools").hidden = !has;
+  $("#shelf-lede").textContent = has ? "Tick the playlists to copy. Each becomes a new playlist on YouTube Music." : "Playlists you add show up here.";
+  const q = $("#pl-filter").value.trim().toLowerCase();
+  const items = state.library.filter((p) => !q || p.name.toLowerCase().includes(q));
+  const list = $("#pl-list");
+  if (!has) list.replaceChildren();
+  else if (!items.length) list.replaceChildren(h("li", { class: "shelf-empty", text: "No playlists match that filter." }));
+  else list.replaceChildren(...items.map(shelfItem));
+  renderDecks();
+  renderActionBar();
+}
+
+function shelfItem(p) {
+  const id = `pl-${p.uid}`;
+  const meta = [plural(p.tracks.length, "song"), p.owner && p.source !== "paste" ? `by ${p.owner}` : null, SOURCE_TEXT[p.source]].filter(Boolean).join(", ");
   return h("li", {},
-    h("label", { class: `tape${p.readable ? "" : " locked"}`, for: id, title: p.readable ? null : "Spotify only lets apps read playlists you own or collaborate on." },
-      input, coverFor(p),
-      h("span", { class: "tape-body" }, h("span", { class: "tape-name", text: p.name }), h("span", { class: "tape-meta", text: meta })),
+    h("label", { class: "tape", for: id },
+      h("input", {
+        type: "checkbox", id, class: "sr-only", checked: state.selected.has(p.uid),
+        onchange: (e) => { e.target.checked ? state.selected.add(p.uid) : state.selected.delete(p.uid); saveLibrary(); renderActionBar(); },
+      }),
+      coverFor(p),
+      h("span", { class: "tape-body" },
+        h("span", { class: "tape-name", text: p.name }),
+        h("span", { class: "tape-meta" }, meta, p.note ? h("span", { class: "note", text: `. ${p.note}` }) : null)
+      ),
       h("span", { class: "led", "aria-hidden": "true" })
-    )
+    ),
+    h("button", {
+      type: "button", class: "tape-remove", "aria-label": `Remove ${p.name}`,
+      onclick: () => { state.library = state.library.filter((x) => x.uid !== p.uid); state.selected.delete(p.uid); saveLibrary(); renderShelf(); },
+    }, "Remove")
   );
 }
 
-$("#pl-filter").addEventListener("input", renderPlaylists);
-$("#pl-refresh").addEventListener("click", loadPlaylists);
+$("#pl-filter").addEventListener("input", renderShelf);
 $("#pl-all").addEventListener("click", () => {
   const q = $("#pl-filter").value.trim().toLowerCase();
-  const visible = state.playlists.filter((p) => p.readable && (!q || p.name.toLowerCase().includes(q)));
-  const allOn = visible.every((p) => state.selected.has(p.id));
-  visible.forEach((p) => (allOn ? state.selected.delete(p.id) : state.selected.add(p.id)));
-  store.set("selected", [...state.selected]);
-  renderPlaylists();
+  const visible = state.library.filter((p) => !q || p.name.toLowerCase().includes(q));
+  const allOn = visible.every((p) => state.selected.has(p.uid));
+  visible.forEach((p) => (allOn ? state.selected.delete(p.uid) : state.selected.add(p.uid)));
+  saveLibrary();
+  renderShelf();
+});
+$("#pl-clear").addEventListener("click", (e) => {
+  const b = e.currentTarget;
+  if (b.dataset.armed !== "1") {
+    b.dataset.armed = "1";
+    b.textContent = "Click again to remove all";
+    setTimeout(() => { b.dataset.armed = "0"; b.textContent = "Remove all"; }, 3000);
+    return;
+  }
+  b.dataset.armed = "0";
+  b.textContent = "Remove all";
+  state.library = [];
+  state.selected.clear();
+  saveLibrary();
+  renderShelf();
 });
 
-// ------------------------------------------------------------------ running work (matching / transfer)
+// ------------------------------------------------------------------ running work
+
+function setWork(title, lede) {
+  $("#work-title").textContent = title;
+  $("#work-lede").textContent = lede;
+  $("#work-label").textContent = "Starting…";
+  $("#work-bar i").style.width = "0%";
+}
 
 function tick({ label, done, total, verb }) {
   const p = total ? done / total : 0;
@@ -665,86 +776,65 @@ window.addEventListener("beforeunload", (e) => {
   if (state.run) { e.preventDefault(); e.returnValue = ""; }
 });
 
+// ------------------------------------------------------------------ matching
+
 const trackKey = (t) => t.id || `${t.title}|${t.artists.join(",")}`;
 
 async function startMatch() {
   clearFlash();
-  const pls = state.playlists.filter((p) => state.selected.has(p.id) && p.readable);
+  const pls = state.library.filter((p) => state.selected.has(p.uid));
   if (!pls.length) return;
   beginRun("match");
-  $("#work-title").textContent = "Finding your songs on YouTube Music";
-  $("#work-lede").textContent = "Each song is looked up by its recording code first, then by title, artist and length. Keep this tab open.";
+  setWork("Finding your songs on YouTube Music", "Each song is matched by title, artist and length (and by its recording code when the file has one). Keep this tab open.");
   setLabels(pls.length === 1 ? pls[0].name : `${pls.length} playlists`, "YouTube Music");
   show("working");
 
-  // 1. read the playlists from Spotify
-  const loaded = [];
-  const errors = [];
-  for (const [i, pl] of pls.entries()) {
-    if (state.run.cancelled) break;
-    const label = `Reading “${pl.name}” from Spotify (${i + 1} of ${pls.length})…`;
-    tick({ label, done: 0, total: 0, verb: "Reading…" });
-    try {
-      const tracks = await spotify.tracks(pl.id, (d, t) => tick({ label, done: d, total: t }));
-      loaded.push({ pl, tracks, rows: new Array(tracks.length) });
-    } catch (err) {
-      if (err.status === 401) { state.run = null; setTape(0, false); return handleAuthError(err); }
-      errors.push({ playlist: pl.name, error: err.message });
-    }
-  }
-
-  // 2. match on YouTube Music, a few songs per request, two requests at a time
-  const queue = [];
-  loaded.forEach((L, pi) => L.tracks.forEach((t, ti) => queue.push({ pi, ti, t })));
-  const total = queue.length;
-  let done = 0;
+  const rows = pls.map((p) => new Array(p.tracks.length));
   const pending = [];
-  for (const q of queue) {
-    const hit = matchCache.get(trackKey(q.t));
-    if (hit) { loaded[q.pi].rows[q.ti] = { spotify: q.t, ...hit }; done++; }
-    else pending.push(q);
-  }
+  let done = 0;
+  pls.forEach((p, pi) => p.tracks.forEach((t, ti) => {
+    const hit = matchCache.get(trackKey(t));
+    if (hit) { rows[pi][ti] = { spotify: t, ...hit }; done++; }
+    else pending.push({ pi, ti, t });
+  }));
+  const total = done + pending.length;
   tick({ label: "Finding songs on YouTube Music…", done, total });
 
-  let fatal = null;
-  async function worker() {
-    while (pending.length && !state.run.cancelled && !fatal) {
+  const worker = async () => {
+    while (pending.length && !state.run.cancelled) {
       const batch = pending.splice(0, 6);
       let results;
-      try {
-        results = (await ytm.call("/api/ytm/match", { tracks: batch.map((b) => b.t) })).results;
-      } catch (err) {
-        if (err.status === 401) { fatal = err; return; }
-        results = batch.map(() => ({ match: null, candidates: [], error: err.message }));
+      for (let attempt = 0; ; attempt++) {
+        try {
+          results = (await api("/api/ytm/match", { method: "POST", body: { tracks: batch.map((b) => b.t), region } })).results;
+          break;
+        } catch (err) {
+          if (attempt < 2 && (err.status === 0 || err.status >= 500)) { await sleep(1500 * (attempt + 1)); continue; }
+          results = batch.map(() => ({ match: null, candidates: [], error: err.message }));
+          break;
+        }
       }
       batch.forEach((b, k) => {
         const r = results[k];
-        loaded[b.pi].rows[b.ti] = { spotify: b.t, ...r };
+        rows[b.pi][b.ti] = { spotify: b.t, ...r };
         if (!r.error) matchCache.set(trackKey(b.t), r);
       });
       done += batch.length;
-      tick({ label: `Matching “${loaded[batch[0].pi].pl.name}”…`, done, total });
+      tick({ label: `Matching “${pls[batch[0].pi].name}”…`, done, total });
     }
-  }
+  };
   await Promise.all([worker(), worker()]);
   const cancelled = state.run.cancelled;
   state.run = null;
-  if (fatal) { setTape(0, false); return handleAuthError(fatal); }
 
-  if (!loaded.length) {
-    setTape(0, false);
-    if (errors.length) flash(errors.map((e) => `${e.playlist}: ${e.error}`).join("\n"));
-    return goChoose();
-  }
-
-  const playlists = loaded.map(({ pl, tracks, rows }) => ({
-    id: pl.id, name: pl.name, description: pl.description, image: pl.image, liked: pl.liked,
-    tracks: tracks.map((t, ti) => rows[ti] || { spotify: t, match: null, candidates: [], error: "Stopped before this song was matched." }),
+  const playlists = pls.map((p, pi) => ({
+    name: p.name, description: p.description, image: p.image, liked: p.liked,
+    tracks: p.tracks.map((t, ti) => rows[pi][ti] || { spotify: t, match: null, candidates: [], error: "Stopped before this song was matched." }),
   }));
   setTape(1, false);
   setTransport(cancelled ? "Stopped" : "Matched");
   setLabels("Spotify", "YouTube Music");
-  loadReview({ playlists, errors });
+  loadReview(playlists);
   show("review");
 }
 
@@ -765,11 +855,10 @@ function inFilter(t) {
   }
 }
 
-function loadReview(result) {
-  const many = result.playlists.length > 1;
+function loadReview(playlists) {
+  const many = playlists.length > 1;
   state.review = {
-    errors: result.errors || [],
-    playlists: result.playlists.map((pl) => ({
+    playlists: playlists.map((pl) => ({
       ...pl,
       outName: pl.liked ? "Liked Songs from Spotify" : pl.name,
       privacy: "PRIVATE",
@@ -778,7 +867,8 @@ function loadReview(result) {
       tracks: pl.tracks.map((t) => ({ ...t, pick: t.match, sel: !!t.match && t.match.confidence !== "low" })),
     })),
   };
-  store.del("results");
+  state.transfer = null;
+  store.del("transfer");
   state.filter = "all";
   state.openAlt = null;
   state.shown = {};
@@ -790,7 +880,7 @@ let saveTimer;
 function saveReview(now = false) {
   clearTimeout(saveTimer);
   const write = () => {
-    if (state.review && !store.set("review", state.review)) store.del("review"); // too big for this browser: skip
+    if (state.review && !store.set("review", state.review)) store.del("review");
   };
   if (now) write();
   else saveTimer = setTimeout(write, 300);
@@ -824,13 +914,10 @@ $$("#filters button").forEach((b) =>
   })
 );
 
+$("#back-to-add").addEventListener("click", goAdd);
+
 function renderReview() {
   renderFilterCounts();
-  $("#review-errors").replaceChildren(
-    ...state.review.errors.map((e) =>
-      h("div", { class: "flash" }, h("span", { class: "led rec", "aria-hidden": "true" }), h("p", {}, h("strong", { text: e.playlist }), `: ${e.error}`))
-    )
-  );
   $("#review-list").replaceChildren(...state.review.playlists.map((pl, pi) => jcard(pl, pi)));
   renderActionBar();
 }
@@ -893,7 +980,7 @@ function trackList(pl, pi, stats) {
   const frag = document.createDocumentFragment();
   for (const [t, ti] of rows.slice(0, limit)) {
     frag.append(trackRow(pl, pi, t, ti, stats));
-    if (state.openAlt === `${pi}:${ti}`) frag.append(altsRow(pl, pi, t, ti, stats));
+    if (state.openAlt === `${pi}:${ti}`) frag.append(altsRow(pl, pi, t, ti));
   }
   ol.append(frag);
   const wrap = h("div", {}, ol);
@@ -921,7 +1008,7 @@ function meter(cand) {
 function durCell(t, cand) {
   if (!cand) return h("span", { class: "dur" });
   const diff = cand.duration && t.spotify.duration_sec ? Math.round(cand.duration - t.spotify.duration_sec) : 0;
-  return h("span", { class: "dur", title: `Spotify ${fmtTime(t.spotify.duration_sec)}` },
+  return h("span", { class: "dur", title: t.spotify.duration_sec ? `Spotify ${fmtTime(t.spotify.duration_sec)}` : null },
     fmtTime(cand.duration),
     Math.abs(diff) >= 8 ? h("span", { class: "off-by", text: `${diff > 0 ? "+" : "−"}${fmtTime(Math.abs(diff))}` }) : null
   );
@@ -968,7 +1055,7 @@ function trackRow(pl, pi, t, ti, stats) {
     const fresh = trackRow(pl, pi, t, ti, stats);
     li.replaceWith(fresh);
     if (state.openAlt === key) {
-      const alt = altsRow(pl, pi, t, ti, stats);
+      const alt = altsRow(pl, pi, t, ti);
       fresh.after(alt);
       if (toggledAlt) alt.querySelector("input")?.focus();
     }
@@ -1021,7 +1108,7 @@ function altsRow(pl, pi, t, ti) {
     btn.disabled = true;
     btn.textContent = "Looking up…";
     try {
-      const { candidate } = await ytm.call("/api/ytm/lookup", { url: form.querySelector("input").value });
+      const { candidate } = await api("/api/ytm/lookup", { method: "POST", body: { url: form.querySelector("input").value } });
       choose(candidate);
     } catch (err) {
       flash(err.message);
@@ -1037,106 +1124,169 @@ function altsRow(pl, pi, t, ti) {
   return box;
 }
 
-// ------------------------------------------------------------------ transfer
+// ------------------------------------------------------------------ transfer (resumable)
+
+function saveTransfer() {
+  store.set("transfer", state.transfer);
+}
 
 async function startTransfer() {
   clearFlash();
   const items = [];
   state.review.playlists.forEach((pl, pi) => {
-    const ids = pl.tracks.filter((t) => t.sel && t.pick).map((t) => t.pick.videoId);
-    if (!ids.length) return;
-    const description = [pl.description, "Copied from Spotify with Dubdeck."].filter(Boolean).join("\n\n");
-    items.push({ pi, name: (pl.outName || pl.name).trim() || pl.name, description, privacy: pl.privacy, mode: pl.mode, ids });
+    const all = pl.tracks.filter((t) => t.sel && t.pick).map((t) => t.pick.videoId);
+    if (!all.length) return;
+    const ids = [...new Set(all)];
+    items.push({
+      pi,
+      name: (pl.outName || pl.name).trim() || pl.name,
+      description: [pl.description, "Copied from Spotify with Dubdeck."].filter(Boolean).join("\n\n"),
+      privacy: pl.privacy,
+      mode: pl.mode,
+      ids,
+      dupes: all.length - ids.length,
+      playlistId: null,
+      url: pl.mode === "like" ? "https://music.youtube.com/playlist?list=LM" : null,
+      next: 0,
+      added: 0,
+      failed: [],
+    });
   });
   if (!items.length) return;
-
-  beginRun("transfer");
-  $("#work-title").textContent = "Writing playlists to YouTube Music";
-  $("#work-lede").textContent = "Playlists are created first, then songs are added in batches of 50. Keep this tab open until it finishes.";
-  setLabels(items.length === 1 ? items[0].name : "Spotify", items.length === 1 ? items[0].name : `${items.length} playlists`);
-  show("transferring");
-
-  const total = items.reduce((a, i) => a + i.ids.length, 0);
-  let done = 0;
-  const results = [];
-  let stopReason = null;
-
-  for (const item of items) {
-    if (state.run.cancelled) break;
-    const seen = new Set();
-    const vids = item.ids.filter((v) => !seen.has(v) && seen.add(v));
-    const res = { pi: item.pi, name: item.name, mode: item.mode, added: 0, failed: [], url: null, duplicates_skipped: item.ids.length - vids.length };
-    results.push(res);
-    done += res.duplicates_skipped;
-    try {
-      if (item.mode === "like") {
-        res.url = "https://music.youtube.com/playlist?list=LM";
-        for (let i = 0; i < vids.length && !state.run.cancelled; i += 20) {
-          const chunk = vids.slice(i, i + 20);
-          tick({ label: `Liking songs for “${item.name}”…`, done, total });
-          const { failed } = await ytm.call("/api/ytm/like", { video_ids: chunk });
-          res.failed.push(...failed);
-          res.added += chunk.length - failed.length;
-          done += chunk.length;
-        }
-      } else {
-        tick({ label: `Creating playlist “${item.name}”…`, done, total });
-        const { playlist_id } = await ytm.call("/api/ytm/create", { title: item.name, description: item.description, privacy: item.privacy }, { retries: 0 });
-        res.url = `https://music.youtube.com/playlist?list=${playlist_id}`;
-        for (let i = 0; i < vids.length && !state.run.cancelled; i += 50) {
-          const chunk = vids.slice(i, i + 50);
-          tick({ label: `Adding songs to “${item.name}”…`, done, total });
-          const { failed } = await ytm.call("/api/ytm/add", { playlist_id, video_ids: chunk });
-          res.failed.push(...failed);
-          res.added += chunk.length - failed.length;
-          done += chunk.length;
-        }
-      }
-    } catch (err) {
-      res.error = err.message;
-      if (err.status === 401) { stopReason = err; break; }
-    }
-    tick({ done, total });
-  }
-
-  const status = stopReason ? "error" : state.run.cancelled ? "cancelled" : "done";
-  state.run = null;
-  setTape(1, false);
-  setTransport(status === "done" ? "Done" : status === "cancelled" ? "Stopped" : "Error");
-  const record = { status, results, done };
-  store.set("results", record);
-  if (stopReason) flash(stopReason.message);
-  showDone(record);
+  state.transfer = { status: "running", reason: null, message: null, items };
+  saveTransfer();
+  runTransfer();
 }
 
-function showDone({ status, results, done }) {
-  const total = results.reduce((a, r) => a + r.added, 0);
-  setCounter(done || total);
-  $("#done-title").textContent = status === "cancelled" ? "Transfer stopped" : status === "error" ? "Transfer stopped early" : "Transfer finished";
-  $("#done-lede").textContent = `${plural(total, "song")} added to YouTube Music. Playlists can take a minute to appear in your library.`;
+const SKIPPABLE = new Set(["videoNotFound", "forbidden", "videoNotAvailable", "videoChartNotFound", "invalidVideoId", "videoRatingDisabled", "notFound"]);
+
+async function runTransfer() {
+  const T = state.transfer;
+  if (!gauth.signedIn() && !(await gauth.signIn())) {
+    T.status = "paused";
+    T.reason = "auth";
+    saveTransfer();
+    return renderDone();
+  }
+  T.status = "running";
+  T.reason = T.message = null;
+  saveTransfer();
+  beginRun("transfer");
+  setWork("Writing playlists to YouTube Music", "Songs are added one at a time through YouTube's official API. Keep this tab open.");
+  const first = T.items.find((it) => it.next < it.ids.length) || T.items[0];
+  setLabels("Spotify", T.items.length === 1 ? first.name : `${T.items.length} playlists`);
+  show("transferring");
+
+  const total = T.items.reduce((a, it) => a + it.ids.length, 0);
+  let done = T.items.reduce((a, it) => a + it.next, 0);
+
+  outer: for (const it of T.items) {
+    if (it.mode === "playlist" && !it.playlistId && it.next < it.ids.length) {
+      if (state.run.cancelled) { T.status = "stopped"; break; }
+      tick({ label: `Creating playlist “${it.name}”…`, done, total });
+      try {
+        it.playlistId = await withRetry(() => yt.createPlaylist(it.name, it.description, it.privacy));
+        it.url = `https://music.youtube.com/playlist?list=${it.playlistId}`;
+        saveTransfer();
+      } catch (e) {
+        if (e.reason === "quotaExceeded") { T.status = "paused"; T.reason = "quota"; break; }
+        if (e.status === 401) { T.status = "paused"; T.reason = "auth"; break; }
+        T.status = "error";
+        T.message = friendlyYtError(e);
+        break;
+      }
+    }
+    while (it.next < it.ids.length) {
+      if (state.run.cancelled) { T.status = "stopped"; break outer; }
+      const vid = it.ids[it.next];
+      tick({ label: `${it.mode === "like" ? "Liking songs for" : "Adding songs to"} “${it.name}”…`, done, total });
+      try {
+        if (it.mode === "like") await withRetry(() => yt.like(vid));
+        else await withRetry(() => yt.addItem(it.playlistId, vid), { retryPlaylistNotFound: it.added === 0 });
+        it.added++;
+      } catch (e) {
+        if (e.reason === "quotaExceeded") { T.status = "paused"; T.reason = "quota"; break outer; }
+        if (e.status === 401) { T.status = "paused"; T.reason = "auth"; break outer; }
+        if (SKIPPABLE.has(e.reason)) {
+          it.failed.push(vid);
+        } else if (e.status === 0 || e.status >= 500 || TRANSIENT.has(e.reason)) {
+          T.status = "paused"; T.reason = "network"; break outer;
+        } else {
+          T.status = "error"; T.message = friendlyYtError(e); break outer;
+        }
+      }
+      it.next++;
+      done++;
+      saveTransfer();
+    }
+  }
+  if (T.status === "running") T.status = "done";
+  saveTransfer();
+  state.run = null;
+  setTape(T.status === "done" ? 1 : total ? done / total : 0, false);
+  setTransport({ done: "Done", paused: "Paused", stopped: "Stopped" }[T.status] || "Error");
+  renderDone();
+}
+
+function untilQuotaReset() {
+  const now = new Date();
+  const pt = new Date(now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
+  const midnight = new Date(pt);
+  midnight.setHours(24, 0, 0, 0);
+  const ms = midnight - pt;
+  const at = new Date(now.getTime() + ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return { hours: Math.max(1, Math.round(ms / 3_600_000)), at };
+}
+
+function renderDone() {
+  const T = state.transfer;
+  if (!T) return goAdd();
+  if (T.status === "running" && !state.run) { T.status = "paused"; T.reason = "interrupted"; saveTransfer(); }
+  const total = T.items.reduce((a, it) => a + it.ids.length, 0);
+  const added = T.items.reduce((a, it) => a + it.added, 0);
+  const processed = T.items.reduce((a, it) => a + it.next, 0);
+  setCounter(added);
+
+  $("#done-title").textContent = { done: "Transfer finished", paused: "Transfer paused", stopped: "Transfer stopped" }[T.status] || "Transfer stopped early";
+  $("#done-lede").textContent = `${added.toLocaleString()} of ${plural(total, "song")} added to YouTube Music.${T.status === "done" ? " Playlists can take a minute to appear in your library." : ""}`;
+
+  const unfinished = processed < total || T.items.some((it) => it.mode === "playlist" && !it.playlistId && it.ids.length);
+  $("#paused").hidden = !unfinished;
+  if (unfinished) {
+    let text;
+    if (T.reason === "quota") {
+      const { hours, at } = untilQuotaReset();
+      text = `Google's daily limit for this app is used up. It resets at midnight Pacific time, in about ${plural(hours, "hour")} (around ${at} your time). Your progress is saved in this browser: come back then and press Continue transfer.`;
+    } else if (T.reason === "auth") text = "Sign in with Google to carry on. Press Continue transfer.";
+    else if (T.reason === "network") text = "Lost the connection to YouTube. Press Continue transfer to retry from where it stopped.";
+    else if (T.reason === "interrupted") text = "The page was closed during the transfer. Press Continue transfer to pick up where it stopped.";
+    else if (T.status === "stopped") text = "You stopped the transfer. Press Continue transfer to carry on.";
+    else text = `${T.message || "Something went wrong."} Press Continue transfer to try again.`;
+    $("#paused-text").textContent = text;
+  }
 
   $("#results").replaceChildren(
-    ...results.map((r) => {
-      const pl = state.review?.playlists[r.pi];
-      const failed = new Set(r.failed || []);
+    ...T.items.map((it) => {
+      const pl = state.review?.playlists[it.pi];
+      const failed = new Set(it.failed);
+      const pending = new Set(it.ids.slice(it.next));
       const missed = pl
         ? pl.tracks.filter((t) => !t.pick || !t.sel || failed.has(t.pick.videoId)).map((t) => `${t.spotify.artists.join(", ")} - ${t.spotify.title}`)
         : [];
-      const attempted = r.added + (r.failed?.length || 0);
-      const meta = r.mode === "like"
-        ? `${plural(r.added, "song")} liked`
-        : `${r.added.toLocaleString()} of ${plural(attempted, "song")} added${r.duplicates_skipped ? `, ${r.duplicates_skipped} duplicates skipped` : ""}`;
+      const meta = it.mode === "like"
+        ? `${plural(it.added, "song")} liked of ${it.ids.length.toLocaleString()}`
+        : `${it.added.toLocaleString()} of ${plural(it.ids.length, "song")} added${it.dupes ? `, ${plural(it.dupes, "duplicate")} skipped` : ""}`;
       const panel = h("article", { class: "panel result" },
         h("div", { class: "result-head" },
-          h("div", {}, h("p", { class: "result-name", text: r.name }), h("p", { class: "result-meta", text: meta })),
-          r.url ? h("a", { class: "key key-primary", href: r.url, target: "_blank", rel: "noopener" }, r.mode === "like" ? "Open liked songs" : "Open in YouTube Music") : null
-        )
+          h("div", {}, h("p", { class: "result-name", text: it.name }), h("p", { class: "result-meta", text: pending.size ? `${meta}. ${plural(pending.size, "song")} still to go.` : meta })),
+          it.url ? h("a", { class: "key key-primary", href: it.url, target: "_blank", rel: "noopener" }, it.mode === "like" ? "Open liked music" : "Open in YouTube Music") : null
+        ),
+        h("div", { class: "bar", role: "img", "aria-label": `${it.added} of ${it.ids.length} added` }, h("i", { style: `width:${it.ids.length ? Math.round((it.added / it.ids.length) * 100) : 0}%` }))
       );
-      if (r.error) panel.append(h("p", { class: "fineprint", text: `Stopped with an error: ${r.error}` }));
       if (missed.length) {
         panel.append(
           h("details", {},
-            h("summary", {}, `${plural(missed.length, "song")} didn't make it over`),
+            h("summary", {}, `${plural(missed.length, "song")} won't make it over`),
             h("ol", { class: "missed" }, ...missed.map((m) => h("li", { text: m }))),
             h("button", { type: "button", class: "key key-small", onclick: (e) => copyText(missed.join("\n"), e.currentTarget) }, "Copy list")
           )
@@ -1148,30 +1298,37 @@ function showDone({ status, results, done }) {
   show("done");
 }
 
-$("#start-over").addEventListener("click", () => {
-  store.del("results");
-  store.del("review");
+$("#resume").addEventListener("click", () => runTransfer());
+
+$("#start-over").addEventListener("click", (e) => {
+  const b = e.currentTarget;
+  const T = state.transfer;
+  const unfinished = T && T.items.some((it) => it.next < it.ids.length);
+  if (unfinished && b.dataset.armed !== "1") {
+    b.dataset.armed = "1";
+    b.textContent = "Click again to drop the unfinished transfer";
+    setTimeout(() => { b.dataset.armed = "0"; b.textContent = "Transfer more playlists"; }, 4000);
+    return;
+  }
+  b.dataset.armed = "0";
+  b.textContent = "Transfer more playlists";
+  state.transfer = null;
   state.review = null;
+  store.del("transfer");
+  store.del("review");
   resetDeck();
-  goChoose();
+  goAdd();
 });
 
 // ------------------------------------------------------------------ routing & boot
 
-function goChoose() {
-  show("choose");
-  if (!state.playlists.length) loadPlaylists();
-  else renderPlaylists();
+function goAdd() {
+  show("add");
+  renderShelf();
 }
 
 function route() {
-  if (!bothConnected()) return show("connect");
-  const results = store.get("results");
-  if (results && state.review) {
-    setTape(1, false);
-    setTransport("Done");
-    return showDone(results);
-  }
+  if (state.transfer && state.review) return renderDone();
   if (state.review) {
     const n = state.review.playlists.reduce((a, pl) => a + pl.tracks.length, 0);
     setCounter(n);
@@ -1180,7 +1337,7 @@ function route() {
     renderReview();
     return show("review");
   }
-  goChoose();
+  goAdd();
 }
 
 async function boot() {
@@ -1190,16 +1347,7 @@ async function boot() {
   } catch (err) {
     flash(err.message);
   }
-  try {
-    await spotify.handleCallback();
-  } catch (err) {
-    flash(`Spotify login failed: ${err.message}`);
-  }
-  if (spotify.connected()) {
-    try { await spotify.me(); } catch (err) { flash(err.message); }
-  }
   renderDecks();
-  renderSetup();
   route();
 }
 

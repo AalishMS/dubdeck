@@ -4,12 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Dubdeck</title>
-  <meta name="description" content="Copy your Spotify playlists to YouTube Music.">
+  <meta name="description" content="Copy your Spotify playlists to YouTube Music. No Spotify login needed.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 22'%3E%3Crect width='32' height='22' rx='3' fill='%23383c3a'/%3E%3Crect x='3' y='3' width='26' height='12' rx='1.5' fill='%23f2efe6'/%3E%3Crect x='8' y='7' width='16' height='5' rx='2.5' fill='%232a2623'/%3E%3Ccircle cx='11' cy='9.5' r='1.6' fill='%23e2962b'/%3E%3Ccircle cx='21' cy='9.5' r='1.6' fill='%23e2962b'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=Kalam:wght@400;700&display=swap">
   <link rel="stylesheet" href="/styles.css">
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
   <!-- ============================================================ deck -->
@@ -30,9 +31,8 @@
             <span class="led" aria-hidden="true"></span>
             <div class="bay-text">
               <span class="bay-name"><span class="bay-role">From</span> <strong class="bay-service">Spotify</strong></span>
-              <span class="bay-acct" id="acct-a">Not connected</span>
+              <span class="bay-acct" id="acct-a">Nothing added yet</span>
             </div>
-            <button type="button" class="textbtn" id="disc-a" hidden>Disconnect</button>
           </div>
         </div>
 
@@ -50,9 +50,9 @@
             <span class="led" aria-hidden="true"></span>
             <div class="bay-text">
               <span class="bay-name"><span class="bay-role">To</span> <strong class="bay-service">YouTube Music</strong></span>
-              <span class="bay-acct" id="acct-b">Not connected</span>
+              <span class="bay-acct" id="acct-b">Not signed in</span>
             </div>
-            <button type="button" class="textbtn" id="disc-b" hidden>Disconnect</button>
+            <button type="button" class="textbtn" id="yt-auth">Sign in</button>
           </div>
         </div>
       </div>
@@ -62,10 +62,9 @@
   <nav class="steps" aria-label="Steps">
     <div class="wrap">
       <ol id="steps">
-        <li data-step="0"><span class="step-n">1</span>Connect accounts</li>
-        <li data-step="1"><span class="step-n">2</span>Choose playlists</li>
-        <li data-step="2"><span class="step-n">3</span>Check matches</li>
-        <li data-step="3"><span class="step-n">4</span>Transfer</li>
+        <li data-step="0"><span class="step-n">1</span>Add playlists</li>
+        <li data-step="1"><span class="step-n">2</span>Check matches</li>
+        <li data-step="2"><span class="step-n">3</span>Transfer</li>
       </ol>
     </div>
   </nav>
@@ -77,102 +76,90 @@
       <button type="button" class="textbtn" id="flash-close">Dismiss</button>
     </div>
 
-    <!-- ========================================================== connect -->
-    <section class="view" id="view-connect" hidden>
+    <!-- ========================================================== google setup (shown when no client ID is configured) -->
+    <section class="panel" id="google-setup" hidden>
+      <h3>Set up Google sign-in</h3>
+      <p class="lede">This copy of Dubdeck doesn't have a Google sign-in ID yet. Making one is free and takes about ten minutes.</p>
+      <ol class="howto">
+        <li><span>Open the <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener">Google Cloud console</a> and create a project (any name).</span></li>
+        <li><span>Turn on the <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">YouTube Data API v3</a> for that project.</span></li>
+        <li><span>Open <a href="https://console.cloud.google.com/auth/overview" target="_blank" rel="noopener">Google Auth Platform</a>, choose <b>Get started</b>, pick <b>External</b>, then under <b>Audience</b> add your Gmail address as a test user.</span></li>
+        <li><span>Under <b>Clients</b>, create a <b>Web application</b> client and add <code id="g-origin"></code> <button type="button" class="textbtn" id="copy-origin">Copy</button> to <b>Authorized JavaScript origins</b>.</span></li>
+        <li><span>Copy the client ID and paste it here.</span></li>
+      </ol>
+      <form class="inline-form" id="form-google" autocomplete="off">
+        <div class="field">
+          <label for="google-client-id">Google client ID</label>
+          <input type="text" id="google-client-id" spellcheck="false" placeholder="1234567890-abc123.apps.googleusercontent.com" required>
+        </div>
+        <button class="key" type="submit">Save client ID</button>
+      </form>
+    </section>
+
+    <!-- ========================================================== add playlists -->
+    <section class="view" id="view-add" hidden>
       <div class="view-head">
-        <h2>Connect both accounts</h2>
-        <p class="lede">Dubdeck reads your playlists from Spotify and writes them to YouTube Music. Your logins stay in this browser. The Dubdeck server never stores them.</p>
+        <h2>Add your Spotify playlists</h2>
+        <p class="lede">No Spotify login needed. Paste songs or a playlist link, or upload an export file. Nothing is sent to YouTube Music until you choose Transfer.</p>
       </div>
 
       <div class="setup-grid">
-        <article class="panel" id="setup-spotify">
-          <h3>Spotify</h3>
-
-          <div id="sp-connected" class="connected-row" hidden>
-            <span class="led on" aria-hidden="true"></span>
-            <p>Connected as <strong id="sp-user"></strong></p>
-          </div>
-
-          <div id="sp-setup" class="panel-body" hidden>
-            <div style="display:grid;gap:1rem">
-              <p class="lede">Spotify asks every tool like this to have its own developer app. Setting one up takes about two minutes.</p>
-              <ol class="howto">
-                <li><span>Open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify developer dashboard</a> and choose <b>Create app</b>. Any name and description will do.</span></li>
-                <li><span>Under <b>Redirect URIs</b>, add <code id="redirect-uri"></code> <button type="button" class="textbtn" id="copy-redirect">Copy</button></span></li>
-                <li><span>Tick <b>Web API</b>, save, then copy the <b>Client ID</b> from the app's page.</span></li>
-              </ol>
-              <form class="inline-form" id="form-client-id" autocomplete="off">
-                <div class="field">
-                  <label for="client-id">Client ID</label>
-                  <input type="text" id="client-id" name="client-id" spellcheck="false" placeholder="32 letters and numbers" required>
-                </div>
-                <button class="key" type="submit">Save Client ID</button>
-              </form>
+        <article class="panel">
+          <h3>Paste from Spotify</h3>
+          <ol class="howto">
+            <li><span>In the Spotify <b>desktop app</b>, open a playlist or Liked Songs.</span></li>
+            <li><span>Click a song, press <b>Ctrl+A</b> to select them all, then <b>Ctrl+C</b> (on a Mac, <b>⌘A</b> and <b>⌘C</b>).</span></li>
+            <li><span>Paste below. A link to a public playlist or album works too, but Spotify only shares its first 100 songs that way.</span></li>
+          </ol>
+          <form id="form-paste" style="display:grid;gap:0.8rem" autocomplete="off">
+            <div class="field">
+              <label for="paste-name">Playlist name</label>
+              <input type="text" id="paste-name" maxlength="150" placeholder="Name for pasted songs, e.g. Road trip">
             </div>
-          </div>
-
-          <div id="sp-ready" hidden style="display:grid;gap:0.9rem">
-            <p class="connected-row"><span class="led amber" aria-hidden="true"></span><span>Using the Client ID ending in <strong id="sp-client-tail"></strong>.</span> <button type="button" class="textbtn" id="sp-change">Change</button></p>
-            <p class="fineprint">Make sure <code id="redirect-uri-2"></code> is listed under Redirect URIs in that Spotify app.</p>
-            <div><button type="button" class="key key-primary" id="sp-login">Connect Spotify</button></div>
-          </div>
-
-          <p class="fineprint">Spotify only lets the app's owner and up to five people they add use a developer app, and the owner needs Premium. Only playlists you own or collaborate on can be read.</p>
+            <div class="field">
+              <label for="paste-box">Songs or links</label>
+              <textarea id="paste-box" spellcheck="false" placeholder="https://open.spotify.com/track/…&#10;https://open.spotify.com/track/…&#10;or https://open.spotify.com/playlist/…" required></textarea>
+            </div>
+            <div><button class="key key-primary" type="submit">Add songs</button></div>
+          </form>
         </article>
 
-        <article class="panel" id="setup-ytm">
-          <h3>YouTube Music</h3>
-
-          <div id="yt-connected" class="connected-row" hidden>
-            <span class="led on" aria-hidden="true"></span>
-            <p>Connected as <strong id="yt-user"></strong></p>
-          </div>
-
-          <div id="yt-setup" style="display:grid;gap:1rem" hidden>
-            <p class="lede">YouTube Music has no public sign-in for tools like this, so Dubdeck uses a copy of your browser's request headers instead.</p>
-            <ol class="howto">
-              <li><span>Open <a href="https://music.youtube.com" target="_blank" rel="noopener">music.youtube.com</a> in Chrome, Edge or Firefox and make sure you're signed in.</span></li>
-              <li><span>Press <b>F12</b>, open the <b>Network</b> tab and type <code>browse</code> in its filter box.</span></li>
-              <li><span>Click <b>Library</b> in YouTube Music so a <code>browse</code> request appears.</span></li>
-              <li><span>Right-click the request and choose <b>Copy</b>, then <b>Copy request headers</b>. In Firefox, open its <b>Headers</b> panel, switch on <b>Raw</b> under Request Headers and copy everything.</span></li>
-            </ol>
-            <form id="form-ytm" style="display:grid;gap:0.8rem" autocomplete="off">
-              <div class="field">
-                <label for="ytm-headers">Request headers</label>
-                <textarea id="ytm-headers" name="ytm-headers" spellcheck="false" placeholder="accept: */*&#10;authorization: SAPISIDHASH …&#10;cookie: …&#10;x-goog-authuser: 0" required></textarea>
-              </div>
-              <div><button class="key key-primary" type="submit" id="ytm-submit">Connect YouTube Music</button></div>
-            </form>
-          </div>
-
-          <p class="fineprint">These headers work like a password for your Google account. They're kept in this browser and sent only with Dubdeck's requests to YouTube Music. The server uses them for that request and doesn't keep them. Disconnect when you're done.</p>
+        <article class="panel">
+          <h3>Upload a file</h3>
+          <p class="lede">Adds every playlist in the file at once.</p>
+          <ul class="sources">
+            <li><b>Exportify</b> CSV from <a href="https://exportify.net" target="_blank" rel="noopener">exportify.net</a>: instant, with every playlist and Liked Songs. Its song codes give the most accurate matches.</li>
+            <li><b>TuneMyMusic</b> CSV export.</li>
+            <li><b>Spotify data download</b> (<code>Playlist1.json</code>, <code>YourLibrary.json</code>), requested under <a href="https://www.spotify.com/account/privacy/" target="_blank" rel="noopener">Spotify privacy settings</a>. It arrives by email within a few days; unzip it first.</li>
+          </ul>
+          <label class="dropzone" for="file-input" id="dropzone">
+            <input type="file" id="file-input" class="sr-only" multiple accept=".csv,.json,text/csv,application/json">
+            <span class="dropzone-title">Choose files</span>
+            <span class="dropzone-sub">or drop them here (.csv or .json)</span>
+          </label>
         </article>
       </div>
-    </section>
 
-    <!-- ========================================================== choose -->
-    <section class="view" id="view-choose" hidden>
       <div class="view-head-row">
         <div class="view-head">
-          <h2>Choose playlists</h2>
-          <p class="lede">Each one becomes a new playlist on YouTube Music. You'll check the matches before anything is created.</p>
+          <h2 class="h-small">Your playlists</h2>
+          <p class="lede" id="shelf-lede">Playlists you add show up here. Tick the ones to copy.</p>
         </div>
-        <div class="shelf-tools">
+        <div class="shelf-tools" id="shelf-tools" hidden>
           <label class="sr-only" for="pl-filter">Filter playlists</label>
           <input type="search" id="pl-filter" placeholder="Filter playlists">
           <button type="button" class="key key-small" id="pl-all">Select all</button>
-          <button type="button" class="key key-small" id="pl-refresh">Reload</button>
+          <button type="button" class="key key-small" id="pl-clear">Remove all</button>
         </div>
       </div>
-      <ul class="shelf" id="pl-list" aria-label="Your Spotify playlists"></ul>
-      <p class="fineprint" id="pl-locked-note" hidden>Greyed-out playlists belong to someone else, and Spotify doesn't let apps read their songs. To bring one over, open it in Spotify, select all songs (Ctrl+A), add them to a new playlist of your own, then reload this list.</p>
+      <ul class="shelf" id="pl-list" aria-label="Playlists you added"></ul>
     </section>
 
     <!-- ========================================================== working -->
     <section class="view" id="view-working" hidden>
       <div class="view-head">
-        <h2 id="work-title">Finding your songs on YouTube Music</h2>
-        <p class="lede" id="work-lede">Each song is looked up by its recording code first, then by title, artist and length. Keep this tab open.</p>
+        <h2 id="work-title">Working</h2>
+        <p class="lede" id="work-lede"></p>
       </div>
       <div class="panel work">
         <p class="work-label" id="work-label" aria-live="polite">Starting…</p>
@@ -195,15 +182,19 @@
           <button type="button" data-filter="skipped" aria-pressed="false">Left out <span class="n" id="n-skipped">0</span></button>
         </div>
       </div>
-      <div id="review-errors"></div>
       <div id="review-list" style="display:grid;gap:1.25rem"></div>
+      <div><button type="button" class="textbtn" id="back-to-add">Back to playlists</button></div>
     </section>
 
     <!-- ========================================================== done -->
     <section class="view" id="view-done" hidden>
       <div class="view-head">
         <h2 id="done-title">Transfer finished</h2>
-        <p class="lede" id="done-lede">Your new playlists are in your YouTube Music library.</p>
+        <p class="lede" id="done-lede"></p>
+      </div>
+      <div class="panel paused" id="paused" hidden>
+        <p id="paused-text"></p>
+        <div><button type="button" class="key key-primary" id="resume"><span class="rec-dot" aria-hidden="true"></span>Continue transfer</button></div>
       </div>
       <div class="results" id="results"></div>
       <div><button type="button" class="key" id="start-over">Transfer more playlists</button></div>

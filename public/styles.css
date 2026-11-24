@@ -674,3 +674,49 @@ a.t-title:hover { text-decoration: underline; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ------------------------------------------------------------------ add playlists */
+.h-small { font-size: var(--fs-lg) !important; }
+.sources { margin: 0; padding-left: 1.1rem; display: grid; gap: 0.45rem; font-size: var(--fs-sm); color: var(--ink-2); }
+.sources b { color: var(--ink); font-weight: 650; }
+.dropzone {
+  display: grid;
+  justify-items: center;
+  gap: 0.2rem;
+  padding: 1.4rem 1rem;
+  border: 1.5px dashed var(--line);
+  border-radius: var(--r-panel);
+  background: var(--bg);
+  text-align: center;
+  cursor: pointer;
+}
+.dropzone:hover, .dropzone.over { border-color: var(--amber); }
+.dropzone:has(input:focus-visible) { outline: 2px solid var(--amber); outline-offset: 2px; }
+.dropzone-title { font-weight: 700; font-stretch: 110%; }
+.dropzone-sub { font-size: var(--fs-xs); color: var(--ink-2); }
+
+.shelf li { position: relative; }
+.shelf .tape { position: relative; padding-right: 6.4rem; grid-template-columns: 3.4rem minmax(0, 1fr); }
+.shelf .tape .led { position: absolute; right: 0.95rem; top: 50%; transform: translateY(-50%); }
+.tape-remove {
+  position: absolute;
+  right: 2.1rem;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 0;
+  background: none;
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+  padding: 0.3rem 0.1rem;
+  cursor: pointer;
+}
+.tape-remove:hover { color: var(--rec); }
+.tape-meta .note { color: var(--warn); }
+
+/* ------------------------------------------------------------------ transfer pause */
+.paused { border-color: var(--warn); }
+.paused p { max-width: 70ch; }
+.result .bar { height: 6px; background: var(--well); border-radius: 3px; overflow: hidden; }
+.result .bar i { display: block; height: 100%; background: var(--ok); }

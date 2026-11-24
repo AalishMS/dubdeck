@@ -1,14 +1,14 @@
-"""FastAPI app: a stateless JSON API for the YouTube Music side.
+"""FastAPI app: a small, stateless JSON API. It holds no credentials.
 
-Spotify is handled entirely in the browser (PKCE). YouTube Music headers live in the
-browser too and arrive with each request; nothing is stored here. Locally this app also
-serves ./public; on Vercel the CDN serves ./public and this runs as one function.
+- /api/spotify/*  reads songs from Spotify's public embed pages (no Spotify login)
+- /api/ytm/*      searches YouTube Music anonymously to match songs
+Writing playlists happens in the browser with the user's own Google sign-in.
+Locally this app also serves ./public; on Vercel the CDN serves ./public.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -17,12 +17,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import ytm
+from . import spotify_public, ytm
 from .matcher import SpotifyTrack
 
 ON_VERCEL = bool(os.environ.get("VERCEL"))
 PUBLIC = Path(__file__).resolve().parent.parent / "public"
-VIDEO_ID = r"^[A-Za-z0-9_-]{11}$"
 
 app = FastAPI(title="Dubdeck", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -37,24 +36,28 @@ async def _ytm_err(_: Request, e: ytm.YTMError):
     return JSONResponse({"detail": str(e)}, status_code=e.status)
 
 
+@app.exception_handler(spotify_public.SpotifyPublicError)
+async def _sp_err(_: Request, e: spotify_public.SpotifyPublicError):
+    return JSONResponse({"detail": str(e)}, status_code=e.status)
+
+
 # ---------------------------------------------------------------- models
 
 
-class AuthBody(BaseModel):
-    auth: dict[str, str]
+class SpotifyIdsIn(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=50)
 
-    @field_validator("auth")
+    @field_validator("ids")
     @classmethod
-    def _check_auth(cls, v: dict[str, str]) -> dict[str, str]:
-        if not v or len(v) > 100 or sum(len(k) + len(x) for k, x in v.items()) > 60_000:
-            raise ValueError("invalid YouTube Music headers")
-        if "cookie" not in {k.lower() for k in v}:
-            raise ValueError("YouTube Music headers are missing the cookie")
+    def _ids(cls, v: list[str]) -> list[str]:
+        if not all(spotify_public.ID_RE.match(x) for x in v):
+            raise ValueError("invalid Spotify track id")
         return v
 
 
-class ConnectIn(BaseModel):
-    headers: str = Field(min_length=1, max_length=200_000)
+class CollectionIn(BaseModel):
+    kind: str = Field(pattern="^(playlist|album)$")
+    id: str = Field(pattern=r"^[A-Za-z0-9]{22}$")
 
 
 class TrackIn(BaseModel):
@@ -66,43 +69,13 @@ class TrackIn(BaseModel):
     isrc: str | None = Field(default=None, max_length=20)
 
 
-class MatchIn(AuthBody):
+class MatchIn(BaseModel):
     tracks: list[TrackIn] = Field(min_length=1, max_length=12)
+    region: str | None = Field(default=None, pattern="^[A-Za-z]{2}$")
 
 
-class LookupIn(AuthBody):
+class LookupIn(BaseModel):
     url: str = Field(min_length=1, max_length=500)
-
-
-class CreateIn(AuthBody):
-    title: str = Field(min_length=1, max_length=300)
-    description: str = Field(default="", max_length=10_000)
-    privacy: str = Field(default="PRIVATE", pattern="^(PRIVATE|UNLISTED|PUBLIC)$")
-
-
-def _check_video_ids(v: list[str]) -> list[str]:
-    if not all(re.match(VIDEO_ID, x) for x in v):
-        raise ValueError("invalid video id")
-    return v
-
-
-class AddIn(AuthBody):
-    playlist_id: str = Field(pattern=r"^[A-Za-z0-9_-]{2,64}$")
-    video_ids: list[str] = Field(min_length=1, max_length=100)
-
-    @field_validator("video_ids")
-    @classmethod
-    def _ids(cls, v: list[str]) -> list[str]:
-        return _check_video_ids(v)
-
-
-class LikeIn(AuthBody):
-    video_ids: list[str] = Field(min_length=1, max_length=25)
-
-    @field_validator("video_ids")
-    @classmethod
-    def _ids(cls, v: list[str]) -> list[str]:
-        return _check_video_ids(v)
 
 
 # ---------------------------------------------------------------- api
@@ -110,39 +83,28 @@ class LikeIn(AuthBody):
 
 @app.get("/api/config")
 def config():
-    return {"spotify_client_id": os.environ.get("SPOTIFY_CLIENT_ID") or None}
+    return {"google_client_id": os.environ.get("GOOGLE_CLIENT_ID") or None}
 
 
-@app.post("/api/ytm/connect")
-def ytm_connect(body: ConnectIn):
-    auth = ytm.parse_headers(body.headers)
-    return {"auth": auth, "account": ytm.account(auth)}
+@app.post("/api/spotify/tracks")
+def spotify_tracks(body: SpotifyIdsIn):
+    return {"tracks": spotify_public.tracks(body.ids)}
+
+
+@app.post("/api/spotify/collection")
+def spotify_collection(body: CollectionIn):
+    return spotify_public.collection(body.kind, body.id)
 
 
 @app.post("/api/ytm/match")
 def ytm_match(body: MatchIn):
     tracks = [SpotifyTrack(**t.model_dump()) for t in body.tracks]
-    return {"results": ytm.match_many(body.auth, tracks)}
+    return {"results": ytm.match_many(tracks, region=body.region)}
 
 
 @app.post("/api/ytm/lookup")
 def ytm_lookup(body: LookupIn):
-    return {"candidate": ytm.lookup(body.auth, body.url)}
-
-
-@app.post("/api/ytm/create")
-def ytm_create(body: CreateIn):
-    return {"playlist_id": ytm.create_playlist(body.auth, body.title, body.description, body.privacy)}
-
-
-@app.post("/api/ytm/add")
-def ytm_add(body: AddIn):
-    return {"failed": ytm.add_items(body.auth, body.playlist_id, body.video_ids)}
-
-
-@app.post("/api/ytm/like")
-def ytm_like(body: LikeIn):
-    return {"failed": ytm.like(body.auth, body.video_ids)}
+    return {"candidate": ytm.lookup(body.url)}
 
 
 # ---------------------------------------------------------------- pages
