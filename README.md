@@ -2,6 +2,8 @@
 
 A small web app that copies your Spotify playlists (and Liked Songs) to YouTube Music.
 
+**Live:** https://dubdeck-lime.vercel.app (bring your own Spotify Client ID; see setup below)
+
 1. **Connect** Spotify and YouTube Music.
 2. **Choose** playlists.
 3. **Check matches.** Every song is looked up on YouTube Music: first by its ISRC (the recording's
