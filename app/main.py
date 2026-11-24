@@ -1,6 +1,6 @@
 """FastAPI app: a small, stateless JSON API. It holds no credentials.
 
-- /api/spotify/*  reads songs from Spotify's public embed pages (no Spotify login)
+- /api/spotify/*  reads public playlists and profiles the way Spotify's embed widget does (no Spotify login)
 - /api/ytm/*      searches YouTube Music anonymously to match songs
 Writing playlists happens in the browser with the user's own Google sign-in.
 Locally this app also serves ./public; on Vercel the CDN serves ./public.
@@ -60,6 +60,10 @@ class CollectionIn(BaseModel):
     id: str = Field(pattern=r"^[A-Za-z0-9]{22}$")
 
 
+class UserIn(BaseModel):
+    id: str = Field(pattern=r"^[^\s/?#:]{1,100}$")
+
+
 class TrackIn(BaseModel):
     id: str | None = Field(default=None, max_length=64)
     title: str = Field(min_length=1, max_length=500)
@@ -94,6 +98,11 @@ def spotify_tracks(body: SpotifyIdsIn):
 @app.post("/api/spotify/collection")
 def spotify_collection(body: CollectionIn):
     return spotify_public.collection(body.kind, body.id)
+
+
+@app.post("/api/spotify/user")
+def spotify_user(body: UserIn):
+    return spotify_public.user_playlists(body.id)
 
 
 @app.post("/api/ytm/match")

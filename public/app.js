@@ -1,7 +1,8 @@
 // Dubdeck front end. Plain JS, no build step.
 //
-// 1. Add playlists: paste Spotify song/playlist links (read via /api/spotify/*, no login)
-//    or upload an Exportify / TuneMyMusic CSV or Spotify data-download JSON.
+// 1. Add playlists: paste a Spotify playlist, album or profile link (read via /api/spotify/*, no
+//    login). For private playlists and Liked Songs: paste songs copied from the desktop app, or
+//    upload an Exportify / TuneMyMusic CSV or Spotify data-download JSON.
 // 2. Check matches: /api/ytm/match searches YouTube Music anonymously.
 // 3. Transfer: the browser signs in with Google and writes playlists through the official
 //    YouTube Data API. Progress is saved so a transfer can continue after Google's daily limit.
@@ -104,6 +105,7 @@ function saveLibrary() {
 // ------------------------------------------------------------------ importing: paste
 
 const LINK_RE = /(?:open\.spotify\.com\/(?:intl-[a-z-]+\/)?(track|playlist|album)\/|spotify:(track|playlist|album):)([A-Za-z0-9]{22})/g;
+const USER_RE = /(?:open\.spotify\.com\/(?:intl-[a-z-]+\/)?user\/|spotify:user:)([^\s/?#:]+)/g;
 
 function parsePaste(text) {
   const trackIds = [];
@@ -113,47 +115,100 @@ function parsePaste(text) {
     if (kind === "track") trackIds.push(m[3]);
     else if (!collections.some((c) => c.id === m[3])) collections.push({ kind, id: m[3] });
   }
+  const users = new Set();
+  for (const m of text.matchAll(USER_RE)) {
+    try { users.add(decodeURIComponent(m[1])); } catch { users.add(m[1]); }
+  }
   const localFiles = (text.match(/spotify:local:|open\.spotify\.com\/local\//g) || []).length;
-  return { trackIds, collections, localFiles };
+  return { trackIds, collections, users: [...users], localFiles };
 }
 
+// A library entry. `sid` is its Spotify id when it came from a link. `pending` means it came from
+// a profile: we know its name and song count, and read the songs only when it's chosen for matching.
 function libEntry(fields) {
-  return { uid: uid(), name: "Untitled", image: null, owner: "", liked: false, source: "paste", note: null, description: "", tracks: [], ...fields };
+  return {
+    uid: uid(), name: "Untitled", image: null, owner: "", liked: false, source: "paste", note: null, description: "",
+    sid: null, pending: false, count: null, tracks: [], ...fields,
+  };
 }
 
-function addToLibrary(entries) {
-  const nonEmpty = entries.filter((e) => e.tracks.length);
-  state.library.push(...nonEmpty);
-  nonEmpty.forEach((e) => state.selected.add(e.uid));
+const songCount = (p) => (p.pending ? p.count || 0 : p.tracks.length);
+
+function addToLibrary(entries, { select = true } = {}) {
+  let n = 0;
+  for (const e of entries) {
+    if (!e.tracks.length && !e.pending) continue;
+    const at = e.sid ? state.library.findIndex((x) => x.sid === e.sid) : -1;
+    if (at >= 0) {
+      if (e.pending) continue; // already on the shelf
+      e.uid = state.library[at].uid; // a fresh read replaces the old copy and keeps its tick
+      state.library[at] = e;
+    } else {
+      state.library.push(e);
+    }
+    if (select) state.selected.add(e.uid);
+    n++;
+  }
   saveLibrary();
-  return nonEmpty.length;
+  return n;
 }
+
+async function readCollection({ kind, id }) {
+  const col = await api("/api/spotify/collection", { method: "POST", body: { kind, id } });
+  return {
+    name: col.name, image: col.image, owner: col.owner, source: kind, sid: col.id, description: col.description || "",
+    tracks: col.tracks,
+    note: col.maybe_truncated ? `Spotify only shared ${plural(col.tracks.length, "song")} from this one. Copy the rest from the desktop app.` : null,
+  };
+}
+
+// Enter adds the link; Shift+Enter still makes a new line. Pasted lists keep their line breaks.
+$("#paste-box").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    $("#form-paste").requestSubmit();
+  }
+});
 
 $("#form-paste").addEventListener("submit", async (e) => {
   e.preventDefault();
   clearFlash();
-  const { trackIds, collections, localFiles } = parsePaste($("#paste-box").value);
-  if (!trackIds.length && !collections.length) {
-    flash("No Spotify links found. In the Spotify desktop app, select songs with Ctrl+A, copy them with Ctrl+C, and paste them here.");
+  const { trackIds, collections, users, localFiles } = parsePaste($("#paste-box").value);
+  if (!trackIds.length && !collections.length && !users.length) {
+    flash("No Spotify links found. Paste the link to a playlist, an album or your profile. It starts with https://open.spotify.com/");
     return;
   }
-  const name = $("#paste-name").value.trim();
   beginRun("import");
-  setWork("Reading songs from Spotify", "Song details come from Spotify's public pages, so no login is needed.");
+  setWork("Reading from Spotify", "Playlists come from Spotify's public pages, so no login is needed.");
   setLabels("Spotify", "Reading…");
   show("working");
 
   const added = [];
+  const fromProfiles = [];
   const problems = [];
   for (const [i, c] of collections.entries()) {
     if (state.run.cancelled) break;
     tick({ label: `Reading ${c.kind} ${i + 1} of ${collections.length}…`, done: 0, total: 0, verb: "Reading…" });
     try {
-      const col = await api("/api/spotify/collection", { method: "POST", body: c });
-      added.push(libEntry({
-        name: col.name, image: col.image, owner: col.owner, source: c.kind, tracks: col.tracks,
-        note: col.maybe_truncated ? "Only the first 100 songs. Paste the rest from the app." : null,
-      }));
+      added.push(libEntry(await readCollection(c)));
+    } catch (err) {
+      problems.push(err.message);
+    }
+  }
+
+  for (const id of users) {
+    if (state.run.cancelled) break;
+    tick({ label: "Listing the playlists on that profile…", done: 0, total: 0, verb: "Reading…" });
+    try {
+      const prof = await api("/api/spotify/user", { method: "POST", body: { id } });
+      const lists = prof.playlists.filter((p) => p.count !== 0);
+      if (!lists.length) {
+        problems.push(`${prof.name}'s profile doesn't show any playlists. In Spotify, open a playlist's ••• menu and choose Add to profile, or paste that playlist's link here instead.`);
+      }
+      fromProfiles.push(...lists.map((p) => libEntry({
+        name: p.name, image: p.image, owner: p.owner, source: "profile", sid: p.id, description: p.description || "",
+        pending: true, count: p.count,
+      })));
     } catch (err) {
       problems.push(err.message);
     }
@@ -182,7 +237,7 @@ $("#form-paste").addEventListener("submit", async (e) => {
     const tracks = trackIds.map((id) => found.get(id)).filter(Boolean);
     const missing = trackIds.length - tracks.length;
     added.push(libEntry({
-      name: name || `Pasted songs ${new Date().toLocaleDateString()}`,
+      name: `Pasted songs ${new Date().toLocaleDateString()}`,
       source: "paste",
       tracks,
       note: missing ? `${plural(missing, "song")} couldn't be read` : null,
@@ -193,16 +248,15 @@ $("#form-paste").addEventListener("submit", async (e) => {
   state.run = null;
   setTape(0, false);
   resetDeck();
-  const n = addToLibrary(added);
-  if (n) {
-    $("#paste-box").value = "";
-    $("#paste-name").value = "";
-  }
+  // Playlists pasted by link are ticked straight away. A whole profile isn't: the user picks from it.
+  const n = addToLibrary(added) + addToLibrary(fromProfiles, { select: false });
+  if (n || (fromProfiles.length && !problems.length)) $("#paste-box").value = "";
   const notes = [...new Set(problems)];
   if (localFiles) notes.push(`${plural(localFiles, "local file")} skipped: local files aren't on Spotify, so they can't be matched.`);
   if (cancelled) notes.unshift("Stopped. Anything read before you stopped was added.");
   goAdd();
   if (notes.length) flash(notes.join(" "));
+  else if (fromProfiles.length) $("#shelf-head").scrollIntoView({ block: "start", behavior: "smooth" });
 });
 
 // ------------------------------------------------------------------ importing: files
@@ -548,7 +602,7 @@ function resetDeck() {
 }
 
 function renderDecks() {
-  const songs = state.library.reduce((a, p) => a + p.tracks.length, 0);
+  const songs = state.library.reduce((a, p) => a + songCount(p), 0);
   $("#bay-a").dataset.state = state.library.length ? "on" : "off";
   $("#acct-a").textContent = state.library.length ? `${plural(state.library.length, "playlist")}, ${plural(songs, "song")}` : "Nothing added yet";
   const on = gauth.signedIn();
@@ -610,7 +664,7 @@ function renderActionBar() {
   btn.disabled = false;
   if (state.view === "add") {
     const chosen = state.library.filter((p) => state.selected.has(p.uid));
-    const songs = chosen.reduce((a, p) => a + p.tracks.length, 0);
+    const songs = chosen.reduce((a, p) => a + songCount(p), 0);
     bar.hidden = !state.library.length;
     sum.replaceChildren(
       chosen.length ? h("span", {}, h("strong", { text: plural(chosen.length, "playlist") }), ` selected, ${plural(songs, "song")}`) : "Tick the playlists you want to copy."
@@ -675,7 +729,7 @@ function coverFor(p) {
   return h("span", { class: "tape-cover" });
 }
 
-const SOURCE_TEXT = { paste: "pasted", playlist: "from a playlist link", album: "album", file: "from a file", export: "from Spotify's data download" };
+const SOURCE_TEXT = { paste: "pasted", playlist: "from a playlist link", profile: "from a profile", album: "album", file: "from a file", export: "from Spotify's data download" };
 
 function renderShelf() {
   const has = state.library.length > 0;
@@ -693,7 +747,7 @@ function renderShelf() {
 
 function shelfItem(p) {
   const id = `pl-${p.uid}`;
-  const meta = [plural(p.tracks.length, "song"), p.owner && p.source !== "paste" ? `by ${p.owner}` : null, SOURCE_TEXT[p.source]].filter(Boolean).join(", ");
+  const meta = [p.pending && p.count == null ? null : plural(songCount(p), "song"), p.owner && p.source !== "paste" ? `by ${p.owner}` : null, SOURCE_TEXT[p.source]].filter(Boolean).join(", ");
   return h("li", {},
     h("label", { class: "tape", for: id },
       h("input", {
@@ -782,10 +836,42 @@ const trackKey = (t) => t.id || `${t.title}|${t.artists.join(",")}`;
 
 async function startMatch() {
   clearFlash();
-  const pls = state.library.filter((p) => state.selected.has(p.uid));
+  let pls = state.library.filter((p) => state.selected.has(p.uid));
   if (!pls.length) return;
   beginRun("match");
-  setWork("Finding your songs on YouTube Music", "Each song is matched by title, artist and length (and by its recording code when the file has one). Keep this tab open.");
+
+  // Playlists listed from a profile don't have their songs yet: read those first.
+  const unread = pls.filter((p) => p.pending);
+  const problems = [];
+  if (unread.length) {
+    setWork("Reading your playlists from Spotify", "Playlists come from Spotify's public pages, so no login is needed.");
+    setLabels("Spotify", "Reading…");
+    show("working");
+    for (const [i, p] of unread.entries()) {
+      if (state.run.cancelled) break;
+      tick({ label: `Reading “${p.name}”…`, done: i, total: unread.length });
+      try {
+        const got = await readCollection({ kind: "playlist", id: p.sid });
+        Object.assign(p, { tracks: got.tracks, note: got.note, description: got.description || p.description, image: p.image || got.image, pending: false });
+        if (!got.tracks.length) problems.push(`“${p.name}” has no songs Dubdeck can read.`);
+      } catch (err) {
+        problems.push(`“${p.name}”: ${err.message}`);
+      }
+    }
+    saveLibrary();
+    pls = pls.filter((p) => !p.pending && p.tracks.length);
+    if (state.run.cancelled || !pls.length) {
+      const stopped = state.run.cancelled;
+      state.run = null;
+      resetDeck();
+      goAdd();
+      if (stopped) problems.unshift("Stopped.");
+      if (problems.length) flash(problems.join(" "));
+      return;
+    }
+  }
+
+  setWork("Finding your songs on YouTube Music", "Each song is matched by title, artist and length, and by its recording code when Spotify shares one. Keep this tab open.");
   setLabels(pls.length === 1 ? pls[0].name : `${pls.length} playlists`, "YouTube Music");
   show("working");
 
@@ -836,6 +922,7 @@ async function startMatch() {
   setLabels("Spotify", "YouTube Music");
   loadReview(playlists);
   show("review");
+  if (problems.length) flash(problems.join(" "));
 }
 
 // ------------------------------------------------------------------ review

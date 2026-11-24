@@ -4,15 +4,18 @@ Copy your Spotify playlists (and Liked Songs) to YouTube Music, with no Spotify 
 
 **Live:** https://dubdeck-lime.vercel.app
 
-1. **Add playlists**, any of these ways:
-   - **Paste from the Spotify desktop app.** Open a playlist or Liked Songs, click a song, press
-     Ctrl+A then Ctrl+C, and paste. Works for private playlists and any number of songs.
-   - **Paste a link** to a public playlist or album. Spotify only shares the first 100 songs this way.
+1. **Add playlists** by pasting a Spotify link:
+   - **A playlist or album link** brings over the whole thing.
+   - **Your profile link** lists every playlist shown on your profile, so you can tick the ones to copy.
+
+   Spotify only shares public playlists this way. For private playlists and Liked Songs, either:
+   - **Paste from the Spotify desktop app.** Open the playlist or Liked Songs, click a song, press
+     Ctrl+A then Ctrl+C, and paste.
    - **Upload a file:**
-     - an [Exportify](https://exportify.net) CSV (instant; includes ISRC codes for the best matches)
+     - an [Exportify](https://exportify.net) CSV
      - a TuneMyMusic CSV
      - Spotify's own data download (`Playlist1.json`, `YourLibrary.json`)
-2. **Check matches.** Each song is looked up on YouTube Music by its ISRC when the file has one, then
+2. **Check matches.** Each song is looked up on YouTube Music by its ISRC when Spotify shares one, then
    by title, artist and length. Each match gets a confidence meter. Uncertain ones (another remix, a
    live version, a big length difference) are flagged so you can pick another candidate or paste a link.
 3. **Transfer.** Sign in with Google. Dubdeck creates private playlists through the official YouTube
@@ -24,7 +27,7 @@ Copy your Spotify playlists (and Liked Songs) to YouTube Music, with no Spotify 
 ## How it's built
 
 - **No credentials on the server.** The FastAPI backend is stateless and has two jobs:
-  - reading song details from Spotify's public embed pages (no account needed)
+  - reading public playlists and profiles the way Spotify's own embed widget does (no account needed)
   - searching YouTube Music anonymously via [ytmusicapi](https://github.com/sigma67/ytmusicapi)
 - **Google sign-in runs in the browser** (Google Identity Services). The browser writes playlists to
   YouTube directly. The access token never reaches the server.
@@ -33,14 +36,15 @@ Copy your Spotify playlists (and Liked Songs) to YouTube Music, with no Spotify 
 ```
 app/
   main.py            FastAPI routes; serves public/ when run locally
-  spotify_public.py  song details from Spotify's public embed pages
+  spotify_public.py  public playlists, profiles and song details from Spotify, without a login
   ytm.py             YouTube Music search and matching
   matcher.py         title/artist/length scoring (no network)
 public/              the web UI (plain HTML/CSS/JS, no build step)
 tests/
 ```
 
-Spotify's embed pages and ytmusicapi are unofficial interfaces, so either could change without notice.
+Spotify's embed pages, the anonymous token they carry and ytmusicapi are unofficial interfaces, so any
+of them could change without notice.
 
 ## Google sign-in setup (once)
 

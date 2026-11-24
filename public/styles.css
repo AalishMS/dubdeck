@@ -695,6 +695,36 @@ a.t-title:hover { text-decoration: underline; }
 .dropzone-title { font-weight: 700; font-stretch: 110%; }
 .dropzone-sub { font-size: var(--fs-xs); color: var(--ink-2); }
 
+/* ------------------------------------------------------------------ footer + privacy page */
+.site-foot { font-size: var(--fs-xs); color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 0.3rem 1.1rem; }
+.deck-top-solo { padding-block: 1.1rem; }
+.prose-title { font-size: var(--fs-xl); font-weight: 800; font-stretch: 118%; letter-spacing: -0.005em; }
+.prose { gap: 0.85rem; max-width: 46rem; }
+.prose h2 { font-size: var(--fs-lg); font-weight: 800; font-stretch: 115%; margin-top: 0.9rem; }
+.prose h2:first-child { margin-top: 0; }
+.prose p, .prose li { color: var(--ink-2); }
+.prose b { color: var(--ink); font-weight: 650; }
+.prose ul { margin: 0; padding-left: 1.1rem; display: grid; gap: 0.35rem; }
+
+.link-form { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end; }
+.link-form .field { flex: 1 1 18rem; }
+.link-form textarea { min-height: 2.9rem; height: 2.9rem; max-height: 14rem; font-size: var(--fs-sm); }
+
+.more-ways { display: grid; gap: 1rem; }
+.more-ways > summary {
+  cursor: pointer;
+  width: fit-content;
+  font-size: var(--fs-sm);
+  font-weight: 650;
+  font-stretch: 112%;
+  color: var(--ink-2);
+}
+.more-ways > summary:hover, .more-ways[open] > summary { color: var(--ink); }
+.more-ways > summary:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; border-radius: 2px; }
+.more-ways[open] > summary { margin-bottom: 0.7rem; }
+.more-ways > .lede { margin-bottom: 1rem; }
+.more-ways .lede b { color: var(--ink); font-weight: 650; }
+
 .shelf li { position: relative; }
 .shelf .tape { position: relative; padding-right: 6.4rem; grid-template-columns: 3.4rem minmax(0, 1fr); }
 .shelf .tape .led { position: absolute; right: 0.95rem; top: 50%; transform: translateY(-50%); }

@@ -100,47 +100,55 @@
     <section class="view" id="view-add" hidden>
       <div class="view-head">
         <h2>Add your Spotify playlists</h2>
-        <p class="lede">No Spotify login needed. Paste songs or a playlist link, or upload an export file. Nothing is sent to YouTube Music until you choose Transfer.</p>
+        <p class="lede">Paste a link and Dubdeck reads the songs. No Spotify login needed, and nothing is sent to YouTube Music until you choose Transfer.</p>
       </div>
 
-      <div class="setup-grid">
-        <article class="panel">
-          <h3>Paste from Spotify</h3>
-          <ol class="howto">
-            <li><span>In the Spotify <b>desktop app</b>, open a playlist or Liked Songs.</span></li>
-            <li><span>Click a song, press <b>Ctrl+A</b> to select them all, then <b>Ctrl+C</b> (on a Mac, <b>⌘A</b> and <b>⌘C</b>).</span></li>
-            <li><span>Paste below. A link to a public playlist or album works too, but Spotify only shares its first 100 songs that way.</span></li>
-          </ol>
-          <form id="form-paste" style="display:grid;gap:0.8rem" autocomplete="off">
-            <div class="field">
-              <label for="paste-name">Playlist name</label>
-              <input type="text" id="paste-name" maxlength="150" placeholder="Name for pasted songs, e.g. Road trip">
-            </div>
-            <div class="field">
-              <label for="paste-box">Songs or links</label>
-              <textarea id="paste-box" spellcheck="false" placeholder="https://open.spotify.com/track/…&#10;https://open.spotify.com/track/…&#10;or https://open.spotify.com/playlist/…" required></textarea>
-            </div>
-            <div><button class="key key-primary" type="submit">Add songs</button></div>
-          </form>
-        </article>
+      <article class="panel">
+        <h3>Paste a Spotify link</h3>
+        <form id="form-paste" class="link-form" autocomplete="off">
+          <div class="field">
+            <label for="paste-box">Playlist, album or profile link</label>
+            <textarea id="paste-box" spellcheck="false" placeholder="https://open.spotify.com/playlist/…" required></textarea>
+          </div>
+          <button class="key key-primary" type="submit">Add</button>
+        </form>
+        <ul class="sources">
+          <li><b>One playlist:</b> open it in Spotify, then <b>•••</b> › <b>Share</b> › <b>Copy link to playlist</b>. The whole playlist comes over.</li>
+          <li><b>All your playlists:</b> open your Spotify profile, then <b>•••</b> › <b>Copy link to profile</b>. Dubdeck lists every playlist shown on your profile so you can tick the ones to copy.</li>
+        </ul>
+      </article>
 
-        <article class="panel">
-          <h3>Upload a file</h3>
-          <p class="lede">Adds every playlist in the file at once.</p>
-          <ul class="sources">
-            <li><b>Exportify</b> CSV from <a href="https://exportify.net" target="_blank" rel="noopener">exportify.net</a>: instant, with every playlist and Liked Songs. Its song codes give the most accurate matches.</li>
-            <li><b>TuneMyMusic</b> CSV export.</li>
-            <li><b>Spotify data download</b> (<code>Playlist1.json</code>, <code>YourLibrary.json</code>), requested under <a href="https://www.spotify.com/account/privacy/" target="_blank" rel="noopener">Spotify privacy settings</a>. It arrives by email within a few days; unzip it first.</li>
-          </ul>
-          <label class="dropzone" for="file-input" id="dropzone">
-            <input type="file" id="file-input" class="sr-only" multiple accept=".csv,.json,text/csv,application/json">
-            <span class="dropzone-title">Choose files</span>
-            <span class="dropzone-sub">or drop them here (.csv or .json)</span>
-          </label>
-        </article>
-      </div>
+      <details class="more-ways" id="more-ways">
+        <summary>Private playlists and Liked Songs</summary>
+        <p class="lede">Spotify only shares public playlists by link. The quickest fix for a private playlist is <b>•••</b> › <b>Make public</b>, paste its link above, then make it private again. Liked Songs and anything you'd rather keep private can come in one of these ways.</p>
+        <div class="setup-grid">
+          <article class="panel">
+            <h3>Copy the songs</h3>
+            <ol class="howto">
+              <li><span>In the Spotify <b>desktop app</b>, open the playlist or Liked Songs.</span></li>
+              <li><span>Click a song, press <b>Ctrl+A</b> to select them all, then <b>Ctrl+C</b> (on a Mac, <b>⌘A</b> and <b>⌘C</b>).</span></li>
+              <li><span>Paste into the box above and press Add. You can rename the playlist before it's transferred.</span></li>
+            </ol>
+          </article>
 
-      <div class="view-head-row">
+          <article class="panel">
+            <h3>Upload a file</h3>
+            <p class="lede">Adds every playlist in the file at once.</p>
+            <ul class="sources">
+              <li><b>Exportify</b> CSV from <a href="https://exportify.net" target="_blank" rel="noopener">exportify.net</a>: instant, with every playlist and Liked Songs.</li>
+              <li><b>TuneMyMusic</b> CSV export.</li>
+              <li><b>Spotify data download</b> (<code>Playlist1.json</code>, <code>YourLibrary.json</code>), requested under <a href="https://www.spotify.com/account/privacy/" target="_blank" rel="noopener">Spotify privacy settings</a>. It arrives by email within a few days; unzip it first.</li>
+            </ul>
+            <label class="dropzone" for="file-input" id="dropzone">
+              <input type="file" id="file-input" class="sr-only" multiple accept=".csv,.json,text/csv,application/json">
+              <span class="dropzone-title">Choose files</span>
+              <span class="dropzone-sub">or drop them here (.csv or .json)</span>
+            </label>
+          </article>
+        </div>
+      </details>
+
+      <div class="view-head-row" id="shelf-head">
         <div class="view-head">
           <h2 class="h-small">Your playlists</h2>
           <p class="lede" id="shelf-lede">Playlists you add show up here. Tick the ones to copy.</p>
@@ -199,6 +207,11 @@
       <div class="results" id="results"></div>
       <div><button type="button" class="key" id="start-over">Transfer more playlists</button></div>
     </section>
+
+    <footer class="site-foot">
+      <a href="/privacy.html">Privacy and terms</a>
+      <a href="https://github.com/AalishMS/dubdeck" target="_blank" rel="noopener">Source on GitHub</a>
+    </footer>
   </main>
 
   <div class="actionbar" id="actionbar" hidden>

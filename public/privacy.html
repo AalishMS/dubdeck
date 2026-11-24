@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Privacy and terms · Dubdeck</title>
+  <meta name="description" content="What Dubdeck does with your playlists and your Google sign-in.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 22'%3E%3Crect width='32' height='22' rx='3' fill='%23383c3a'/%3E%3Crect x='3' y='3' width='26' height='12' rx='1.5' fill='%23f2efe6'/%3E%3Crect x='8' y='7' width='16' height='5' rx='2.5' fill='%232a2623'/%3E%3Ccircle cx='11' cy='9.5' r='1.6' fill='%23e2962b'/%3E%3Ccircle cx='21' cy='9.5' r='1.6' fill='%23e2962b'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=Kalam:wght@400;700&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="deck">
+    <div class="wrap">
+      <div class="deck-top deck-top-solo">
+        <a class="brand" href="/">
+          <svg viewBox="0 0 32 22" aria-hidden="true"><rect width="32" height="22" rx="3" fill="currentColor"/><rect x="3" y="3" width="26" height="12" rx="1.5" fill="var(--label)"/><rect x="8" y="7" width="16" height="5" rx="2.5" fill="var(--window)"/><circle cx="11" cy="9.5" r="1.6" fill="var(--amber)"/><circle cx="21" cy="9.5" r="1.6" fill="var(--amber)"/></svg>
+          Dubdeck
+        </a>
+        <p class="model">Copies Spotify playlists to YouTube Music</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="view-head">
+      <h1 class="prose-title">Privacy and terms</h1>
+      <p class="lede">Last updated 24 November 2026.</p>
+    </div>
+
+    <article class="panel prose">
+      <h2>The short version</h2>
+      <p>Dubdeck has no accounts and no database. Your playlists, your matches and your Google sign-in stay in your own browser. Dubdeck's server never sees your Google sign-in and never stores anything about you.</p>
+
+      <h2>What Dubdeck does with your Google account</h2>
+      <p>Dubdeck uses YouTube API Services to put your playlists on YouTube Music. When you choose <b>Sign in</b>, Google asks you to let Dubdeck manage your YouTube account. With that permission, Dubdeck does only these things, and only when you press Transfer:</p>
+      <ul>
+        <li>reads the name of your YouTube channel, to show which account you signed in with;</li>
+        <li>creates the playlists you chose to transfer;</li>
+        <li>adds the matched songs to those playlists;</li>
+        <li>likes songs, if you chose to send a playlist to your liked music instead.</li>
+      </ul>
+      <p>Dubdeck doesn't read your existing playlists, watch history, subscriptions or comments, and it doesn't change or delete anything that's already in your account.</p>
+      <p>The sign-in happens between your browser and Google. Google gives your browser a temporary access token that lasts about an hour. It is kept in your browser's local storage and sent only to Google. It never reaches Dubdeck's server, so the people who run Dubdeck can't see it or use it.</p>
+
+      <h2>What Dubdeck's server sees</h2>
+      <p>To read a Spotify link and to find each song on YouTube Music, your browser sends these to Dubdeck's server:</p>
+      <ul>
+        <li>the Spotify playlist, album, song or profile links you paste;</li>
+        <li>the title, artists, album and length of each song being matched;</li>
+        <li>a two-letter country code taken from your browser's language, so search results fit your region.</li>
+      </ul>
+      <p>The server uses them to answer the request and then forgets them. Files you upload are read in your browser and are not sent anywhere.</p>
+      <p>Dubdeck is hosted on Vercel, which keeps short-lived technical logs of requests (such as IP address, time and the page requested), as every web host does. Dubdeck doesn't use those logs to identify anyone.</p>
+
+      <h2>What is kept in your browser</h2>
+      <p>Dubdeck saves the playlists you added, your match choices, the progress of a transfer, the name of your YouTube channel and the temporary Google token in this browser's local storage. That is how a transfer can carry on the next day. Clearing this site's data in your browser removes all of it.</p>
+
+      <h2>What Dubdeck doesn't do</h2>
+      <ul>
+        <li>No ads, no analytics and no tracking cookies.</li>
+        <li>No selling or sharing of your data. There is nothing stored to sell or share.</li>
+        <li>No use of your data to train AI models.</li>
+      </ul>
+      <p>The page loads its fonts from Google Fonts and the sign-in button from Google, so Google receives the ordinary request for those files.</p>
+
+      <h2>Taking back access</h2>
+      <p>Choose <b>Sign out</b> in Dubdeck to cancel the token straight away. You can also remove Dubdeck from your Google account at any time on Google's <a href="https://myaccount.google.com/connections" target="_blank" rel="noopener">third-party connections page</a>. Playlists Dubdeck already created stay in your YouTube account until you delete them there.</p>
+
+      <h2>Terms</h2>
+      <p>Dubdeck is a free, personal project offered as it is, with no guarantee that every song will be found or matched correctly. Check the matches before you transfer.</p>
+      <p>Sending playlists to YouTube Music goes through YouTube API Services, so by using Dubdeck you also agree to the <a href="https://www.youtube.com/t/terms" target="_blank" rel="noopener">YouTube Terms of Service</a>. Google's handling of your data is described in the <a href="https://www.google.com/policies/privacy" target="_blank" rel="noopener">Google Privacy Policy</a>. Dubdeck's use of information received from Google APIs follows the <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noopener">Google API Services User Data Policy</a>, including its Limited Use requirements.</p>
+      <p>Dubdeck isn't affiliated with Spotify, YouTube or Google.</p>
+
+      <h2>Questions</h2>
+      <p>Dubdeck's code is public. Ask a question or report a problem at <a href="https://github.com/AalishMS/dubdeck/issues" target="_blank" rel="noopener">github.com/AalishMS/dubdeck</a>.</p>
+    </article>
+
+    <p class="site-foot"><a href="/">Back to Dubdeck</a></p>
+  </main>
+</body>
+</html>
